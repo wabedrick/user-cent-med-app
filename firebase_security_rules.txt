@@ -1,0 +1,44 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users can read their own user document
+    match /users/{userId} {
+      allow read, update: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null;
+    }
+
+    // Equipment: All authenticated users can read, only admins/engineers can write
+    match /equipment/{equipmentId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.token.role in ['admin', 'engineer'];
+    }
+
+    // Repair Requests: Nurses can create, all can read, only engineers/admins can update
+    match /repair_requests/{requestId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth.token.role in ['nurse', 'engineer', 'admin'];
+      allow update: if request.auth.token.role in ['engineer', 'admin'];
+    }
+
+    // Maintenance Schedules: Engineers/admins can write, all can read
+    match /maintenance_schedules/{scheduleId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.token.role in ['engineer', 'admin'];
+    }
+  }
+}
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Only authenticated users can read manuals
+    match /manuals/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.token.role in ['admin', 'engineer'];
+    }
+    // Only authenticated users can read videos
+    match /videos/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.token.role in ['admin', 'engineer'];
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+    "flutter": {
+        "platforms": {
+            "android": {
+                "default": {
+                    "projectId": "user-med-app-fb",
+                    "appId": "1:71933768667:android:db1a7e1aa05b3a0782adfe",
+                    "fileOutput": "android/app/google-services.json"
+                }
+            },
+            "dart": {
+                "lib/firebase_options.dart": {
+                    "projectId": "user-med-app-fb",
+                    "configurations": {
+                        "android": "1:71933768667:android:db1a7e1aa05b3a0782adfe",
+                        "ios": "1:71933768667:ios:cf4e46423e9e121482adfe"
+                    }
+                }
+            }
+        }
+    },
+    "functions": {
+        "source": "functions",
+        "runtime": "nodejs20",
+        "predeploy": [
+            "npm --prefix functions run build"
+        ]
+    },
+    "firestore": {
+        "rules": "firestore.rules"
+    },
+    "storage": {
+        "rules": "storage.rules"
+    }
+}

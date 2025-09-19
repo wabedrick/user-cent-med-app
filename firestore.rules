@@ -1,0 +1,139 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    function authRole() {
+      return request.auth != null ? (request.auth.token.role != null ? request.auth.token.role : 'unknown') : 'none';
+    }
+    function isAdmin() { return authRole() == 'admin'; }
+    function isEngineer() { return authRole() == 'engineer'; }
+    function isNurse() { return authRole() == 'nurse'; }
+
+    // User documents: each user can read/update own doc; creation allowed only for itself; no deletes.
+    match /users/{userId} {
+      // Self can create their own doc, but cannot self-create as admin.
+      allow create: if isSelf(userId) &&
+        (request.resource.data.role == 'engineer' || request.resource.data.role == 'nurse');
+
+      // Self can read own doc; admins can read any.
+      allow read: if isSelf(userId) || isAdmin();
+
+      // Admin can update any doc. A user can update their own doc but cannot change the role field.
+      allow update: if isAdmin() || (isSelf(userId) && request.resource.data.role == resource.data.role);
+      allow delete: if false;
+    }
+
+    // Equipment collection. Signed-in can read; any signed-in can create; only admins can update/delete.
+    match /equipment/{equipId} {
+      allow read: if isSignedIn();
+      // Only engineers or admins can create/update equipment metadata. Delete restricted to admins.
+      allow create, update: if isEngineer() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Admin-only access to audit logs
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow write, update, delete: if false; // write occurs via backend tools only
+    }
+
+    // AI queries audit: server writes only; admins can read. No client writes.
+    match /ai_queries/{qId} {
+      allow read: if isAdmin();
+      allow write, update, delete: if false;
+    }
+
+    // Repair requests: created by nurses (or engineers/admin), updated by engineers/admin; owner can edit description while open.
+    match /repair_requests/{reqId} {
+      function isOwner(data) { return isSignedIn() && data.reportedByUserId == request.auth.uid; }
+      // Read allowed to owner and engineers/admin; optionally allow nurses to read their own only.
+      allow read: if isAdmin() || isEngineer() || (resource != null && isOwner(resource.data));
+
+      // Create: nurses/engineers/admin may create. Ensure owner matches auth and initial status is 'open'.
+      allow create: if (isNurse() || isEngineer() || isAdmin())
+        && request.resource.data.reportedByUserId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.assignedEngineerId == null
+        && request.resource.data.keys().hasOnly(['equipmentId','reportedByUserId','description','status','timestamp','assignedEngineerId'])
+        && request.resource.data.equipmentId is string
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 2000;
+
+      // Updates:
+      // - Engineers/Admin can update status/assignment/description
+      // - Owner nurse can only edit description while status remains 'open'
+      allow update: if (
+        isAdmin() || isEngineer()
+      ) || (
+        // Owner limited edits
+        resource.data.status == 'open'
+        && isOwner(resource.data)
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['description'])
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 2000
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Maintenance schedules: readable by signed-in; writable by engineers/admin. Validate fields.
+    match /maintenance_schedules/{schedId} {
+      allow read: if isSignedIn();
+      allow create, update: if (isEngineer() || isAdmin())
+        && request.resource.data.keys().hasOnly(['equipmentId','dueDate','assignedTo','completed'])
+        && request.resource.data.equipmentId is string
+        && request.resource.data.assignedTo is string
+        && (request.resource.data.completed is bool)
+        && request.resource.data.dueDate != null;
+      allow delete: if isAdmin();
+    }
+
+    // Knowledge links (external resources like YouTube or PDFs)
+    // Fields: title (string <= 200), titleLower (derived), url (string <= 2000), type ('video'|'pdf'), equipmentId (string, optional), createdBy (uid), createdAt (timestamp), tags (string[] optional up to 10 items, each <=30 chars, lowercase recommended)
+    match /knowledge_links/{linkId} {
+      allow read: if isSignedIn();
+      function validTags(arr) {
+        return arr is list
+          && arr.size() <= 10
+          && arr.where(tag => !(tag is string)).size() == 0
+          && arr.where(tag => tag.size() == 0 || tag.size() > 30).size() == 0;
+      }
+      allow create: if (isEngineer() || isAdmin())
+        && request.resource.data.keys().hasOnly(['title','titleLower','url','type','equipmentId','createdBy','createdAt','tags'])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 200
+        && request.resource.data.titleLower is string
+        && request.resource.data.titleLower == request.resource.data.title.lower()
+        && request.resource.data.url is string && request.resource.data.url.size() <= 2000
+        && (request.resource.data.type == 'video' || request.resource.data.type == 'pdf')
+        && (request.resource.data.equipmentId == null || (request.resource.data.equipmentId is string && request.resource.data.equipmentId.size() <= 200))
+        && request.resource.data.createdBy == request.auth.uid
+        && (request.resource.data.tags == null || validTags(request.resource.data.tags));
+
+      allow update: if (isEngineer() || isAdmin())
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['title','titleLower','url','type','equipmentId','tags'])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 200
+        && request.resource.data.titleLower is string
+        && request.resource.data.titleLower == request.resource.data.title.lower()
+        && request.resource.data.url is string && request.resource.data.url.size() <= 2000
+        && (request.resource.data.type == 'video' || request.resource.data.type == 'pdf')
+        && (request.resource.data.equipmentId == null || (request.resource.data.equipmentId is string && request.resource.data.equipmentId.size() <= 200))
+        && (request.resource.data.tags == null || validTags(request.resource.data.tags));
+
+      allow delete: if isAdmin();
+    }
+
+    // Default deny everything else.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

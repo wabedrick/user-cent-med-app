@@ -1,0 +1,6 @@
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    # Customize lint rules here as needed
+    # prefer_single_quotes: true

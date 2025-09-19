@@ -1,0 +1,19 @@
+{
+    "name": "user-cent-med-app-admin-tools",
+    "private": true,
+    "version": "0.1.0",
+    "description": "Local admin / role management helper scripts for Firebase custom claims without deploying Cloud Functions.",
+    "license": "MIT",
+    "type": "commonjs",
+    "scripts": {
+        "roles:list": "node scripts/role_manager.js list-users",
+        "roles:set": "node scripts/role_manager.js set-role",
+        "roles:set-email": "node scripts/role_manager.js set-role-email",
+        "roles:bootstrap": "node scripts/role_manager.js bootstrap",
+        "roles:boostrap": "npm run roles:bootstrap --",
+        "roles:audit": "node scripts/role_manager.js audit-logs"
+    },
+    "dependencies": {
+        "firebase-admin": "^12.0.0"
+    }
+}
