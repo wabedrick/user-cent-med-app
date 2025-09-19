@@ -189,22 +189,51 @@ class _SignInScreenState extends State<SignInScreen> {
                     ]),
                   ],
                   const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      Row(children: [
-                        Checkbox(
-                          value: rememberEmail,
-                          onChanged: loading ? null : (v) => setState(() { rememberEmail = v ?? true; _persistEmail(); }),
-                        ),
-                        const Text('Remember email'),
-                      ]),
-                      const Spacer(),
-                      ElevatedButton(onPressed: loading ? null : _signIn, child: Text(loading ? '...' : 'Sign In')),
-                      TextButton(onPressed: loading ? null : _resetPassword, child: const Text('Forgot password?')),
-                    ],
+                  LayoutBuilder(
+                    builder: (ctx, c) {
+                      final wide = c.maxWidth > 460;
+                      final rememberRow = Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Checkbox(
+                            value: rememberEmail,
+                            onChanged: loading ? null : (v) => setState(() { rememberEmail = v ?? true; _persistEmail(); }),
+                          ),
+                          const Text('Remember email'),
+                        ],
+                      );
+                      final buttons = Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ElevatedButton(
+                            onPressed: loading ? null : _signIn,
+                            child: Text(loading ? '...' : 'Sign In'),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: loading ? null : _resetPassword,
+                            child: const Text('Forgot password?'),
+                          ),
+                        ],
+                      );
+                      if (wide) {
+                        return Row(
+                          children: [
+                            rememberRow,
+                            const Spacer(),
+                            buttons,
+                          ],
+                        );
+                      }
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          rememberRow,
+                          const SizedBox(height: 8),
+                          buttons,
+                        ],
+                      );
+                    },
                   ),
                     const SizedBox(height: 20),
                     Center(

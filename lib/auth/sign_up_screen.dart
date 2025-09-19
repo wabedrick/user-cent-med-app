@@ -253,21 +253,41 @@ class _SignUpScreenState extends State<SignUpScreen> {
                     ]),
                   ],
                   const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      Row(children: [
-                        Checkbox(
-                          value: rememberEmail,
-                          onChanged: loading ? null : (v) => setState(() { rememberEmail = v ?? true; _persistEmail(); }),
-                        ),
-                        const Text('Remember email'),
-                      ]),
-                      const Spacer(),
-                      ElevatedButton(onPressed: loading ? null : _createAccount, child: Text(loading ? '...' : 'Create Account')),
-                    ],
+                  LayoutBuilder(
+                    builder: (ctx, c) {
+                      final wide = c.maxWidth > 460;
+                      final rememberRow = Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Checkbox(
+                            value: rememberEmail,
+                            onChanged: loading ? null : (v) => setState(() { rememberEmail = v ?? true; _persistEmail(); }),
+                          ),
+                          const Text('Remember email'),
+                        ],
+                      );
+                      final createBtn = ElevatedButton(
+                        onPressed: loading ? null : _createAccount,
+                        child: Text(loading ? '...' : 'Create Account'),
+                      );
+                      if (wide) {
+                        return Row(
+                          children: [
+                            rememberRow,
+                            const Spacer(),
+                            createBtn,
+                          ],
+                        );
+                      }
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          rememberRow,
+                          const SizedBox(height: 8),
+                          createBtn,
+                        ],
+                      );
+                    },
                   ),
                   const SizedBox(height: 20),
                   Row(children: const [Expanded(child: Divider()), SizedBox(width: 8), Text('OR'), SizedBox(width: 8), Expanded(child: Divider())]),
@@ -296,7 +316,7 @@ class _CountryDropdown extends StatelessWidget {
   final String? errorText;
   const _CountryDropdown({required this.value, required this.onChanged, this.errorText});
   static const _countries = <String>[
-    'United States','Canada','United Kingdom','Germany','France','Kenya','Nigeria','South Africa','India','Brazil','Japan','Australia'
+    'United States','Canada','United Kingdom','Germany','France','Kenya','Nigeria','South Africa','Uganda','India','Brazil','Japan','Australia'
   ];
   @override
   Widget build(BuildContext context) {

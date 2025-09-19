@@ -242,7 +242,9 @@ class _EngineerOrdersTab extends ConsumerWidget {
                   try {
                     await ref.read(repairRequestsRepositoryProvider).assignToSelf(requestId: req.id, engineerId: user.uid);
                   } catch (e) {
-                    showFriendlyError(context, e, fallback: 'Could not assign the request.');
+                    if (context.mounted) {
+                      showFriendlyError(context, e, fallback: 'Could not assign the request.');
+                    }
                   }
                 },
                 icon: const Icon(Icons.how_to_reg),
@@ -264,7 +266,9 @@ class _EngineerOrdersTab extends ConsumerWidget {
                   try {
                     await ref.read(repairRequestsRepositoryProvider).updateStatus(requestId: req.id, status: v);
                   } catch (e) {
-                    showFriendlyError(context, e, fallback: 'Could not update the request.');
+                    if (context.mounted) {
+                      showFriendlyError(context, e, fallback: 'Could not update the request.');
+                    }
                   }
                 },
                 itemBuilder: (_) => const [
