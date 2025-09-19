@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../theme.dart';
-import '../main.dart' show debugRoleOverrideProvider; // Auth screens split
 import '../auth/sign_in_screen.dart';
 // Removed shared DashboardShell; using dedicated header + sidebar for Nurse
 import '../repositories/repair_requests_repository.dart';
@@ -55,7 +54,8 @@ class _NurseDashboardScreenState extends ConsumerState<NurseDashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final titles = const ['Overview', 'Requests', 'History', 'Profile'];
+    // Nurse has a dedicated Tasks tab distinct from Engineer
+    final titles = const ['Overview', 'Requests', 'Tasks', 'History', 'Profile'];
     final title = titles[(tab >= 0 && tab < titles.length) ? tab : 0];
     final width = MediaQuery.of(context).size.width;
     final isNarrow = width < 900;
@@ -118,10 +118,10 @@ class _NurseBody extends ConsumerWidget {
       return stats.when(
         data: (s) {
           final cards = [
-            _StatCard(label: 'Assigned', value: s.assigned.toString(), icon: Icons.assignment_turned_in_outlined, color: AppColors.primary),
-            _StatCard(label: 'Due Soon', value: s.dueSoon.toString(), icon: Icons.watch_later_outlined, color: AppColors.warning),
-            _StatCard(label: 'Overdue', value: s.overdue.toString(), icon: Icons.error_outline, color: AppColors.error),
-            _StatCard(label: 'Resolved Today', value: s.resolvedToday.toString(), icon: Icons.task_alt, color: AppColors.success),
+            _StatCard(label: 'Assigned', value: s.assigned.toString(), icon: Icons.local_hospital_outlined, color: AppColors.primary),
+            _StatCard(label: 'Due Soon', value: s.dueSoon.toString(), icon: Icons.schedule, color: AppColors.warning),
+            _StatCard(label: 'Overdue', value: s.overdue.toString(), icon: Icons.priority_high_outlined, color: AppColors.error),
+            _StatCard(label: 'Resolved Today', value: s.resolvedToday.toString(), icon: Icons.check_circle_outline, color: AppColors.success),
           ];
           List<Widget> rows = [];
           for (var i = 0; i < cards.length; i += 2) {
@@ -184,13 +184,13 @@ class _NurseBody extends ConsumerWidget {
               children: [
                 Text('Equipment Attention', style: Theme.of(context).textTheme.titleLarge),
                 const Spacer(),
-                TextButton.icon(onPressed: () {}, icon: const Icon(Icons.refresh), label: const Text('Refresh')),
+                TextButton.icon(onPressed: () => ref.invalidate(nurseTasksProvider), icon: const Icon(Icons.refresh), label: const Text('Refresh')),
               ],
             ),
             const SizedBox(height: 12),
             tasksList(),
             const SizedBox(height: 44),
-            Text('Recent Activity', style: Theme.of(context).textTheme.titleLarge),
+            Text('Recent Nursing Activity', style: Theme.of(context).textTheme.titleLarge),
             const SizedBox(height: 12),
             _RecentActivityList(isWide: isWide),
             const SizedBox(height: 96),
@@ -211,8 +211,10 @@ class _NurseBody extends ConsumerWidget {
       case 1:
         return const _RequestsTab();
       case 2:
-        return placeholder('History');
+        return const _NurseTasksTab();
       case 3:
+        return placeholder('History');
+      case 4:
         return placeholder('Profile');
       default:
         return overview();
@@ -263,6 +265,54 @@ class _RequestsTab extends ConsumerWidget {
             },
             loading: () => const Center(child: CircularProgressIndicator()),
             error: (e, _) => _ErrorInline(message: friendlyMessageFor(e), onRetry: () => ref.invalidate(myRepairRequestsProvider(user.uid))),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _NurseTasksTab extends ConsumerWidget {
+  const _NurseTasksTab();
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final tasks = ref.watch(nurseTasksProvider);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+          child: Row(
+            children: [
+              Text('My Tasks', style: Theme.of(context).textTheme.titleLarge),
+              const Spacer(),
+              SegmentedButton<Urgency>(
+                segments: const [
+                  ButtonSegment(value: Urgency.low, label: Text('Low')),
+                  ButtonSegment(value: Urgency.medium, label: Text('Med')),
+                  ButtonSegment(value: Urgency.high, label: Text('High')),
+                ],
+                selected: const <Urgency>{Urgency.low, Urgency.medium, Urgency.high},
+                onSelectionChanged: (_) {},
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: tasks.when(
+            data: (list) {
+              if (list.isEmpty) {
+                return const _EmptyState(icon: Icons.task_alt, title: 'No Tasks', message: 'Nothing assigned at the moment.');
+              }
+              return ListView.separated(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                itemCount: list.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 12),
+                itemBuilder: (ctx, i) => _TaskTile(item: list[i]),
+              );
+            },
+            loading: () => const Center(child: CircularProgressIndicator()),
+            error: (e, _) => _ErrorInline(message: friendlyMessageFor(e), onRetry: () => ref.invalidate(nurseTasksProvider)),
           ),
         ),
       ],
@@ -372,18 +422,19 @@ class _NewRequestDialogState extends ConsumerState<_NewRequestDialog> {
             if (!_formKey.currentState!.validate()) return;
             final user = FirebaseAuth.instance.currentUser;
             if (user == null) return;
-            final messenger = ScaffoldMessenger.of(context);
-            final navigator = Navigator.of(context);
             try {
               await ref.read(repairRequestsRepositoryProvider).create(
                     equipmentId: _equipmentId ?? '',
                     reportedByUserId: user.uid,
                     description: _descCtrl.text.trim(),
                   );
-              if (!mounted) return;
+              if (!context.mounted) return;
+              final navigator = Navigator.of(context);
+              final messenger = ScaffoldMessenger.of(context);
               navigator.pop();
               messenger.showSnackBar(const SnackBar(content: Text('Request created')));
             } catch (e) {
+              if (!context.mounted) return;
               showFriendlyError(context, e, fallback: 'Could not submit.');
             }
           },
@@ -549,15 +600,38 @@ class _RecentActivityList extends StatelessWidget {
   const _RecentActivityList({required this.isWide});
   @override
   Widget build(BuildContext context) {
-    final entries = List.generate(
-      6,
-      (i) => _ActivityEntry(
-        icon: Icons.build_circle_outlined,
-        title: 'Repair ticket #${2450 + i} updated',
-        time: '${i + 1}h ago',
-        detail: i.isEven ? 'Status changed to In Progress' : 'Technician assigned',
+    final entries = <_ActivityEntry>[
+      _ActivityEntry(
+        icon: Icons.medical_services_outlined,
+        title: 'Usage of ECG Monitor logged',
+        time: '5m ago',
+        detail: 'Shift A updated asset status',
       ),
-    );
+      _ActivityEntry(
+        icon: Icons.report_gmailerrorred_outlined,
+        title: 'New repair request submitted',
+        time: '28m ago',
+        detail: 'Infusion Pump tubing alert',
+      ),
+      _ActivityEntry(
+        icon: Icons.task_alt,
+        title: 'Indicator acknowledged',
+        time: '1h ago',
+        detail: 'Ventilator filter check queued',
+      ),
+      _ActivityEntry(
+        icon: Icons.inventory_2_outlined,
+        title: 'Consumables restock requested',
+        time: '2h ago',
+        detail: 'ECG electrodes – 2 boxes',
+      ),
+      _ActivityEntry(
+        icon: Icons.schedule,
+        title: 'Reminder set',
+        time: '3h ago',
+        detail: 'Sterilization audit at 14:00',
+      ),
+    ];
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(18),
@@ -787,16 +861,7 @@ class _ProfileMenu extends ConsumerWidget {
       tooltip: 'Account',
       position: PopupMenuPosition.under,
       onSelected: (value) async {
-        if (value == 'debug_engineer') {
-          ref.read(debugRoleOverrideProvider).setRole('engineer');
-          return;
-        } else if (value == 'debug_admin') {
-          ref.read(debugRoleOverrideProvider).setRole('admin');
-          return;
-        } else if (value == 'debug_clear') {
-          ref.read(debugRoleOverrideProvider).clear();
-          return;
-        } else if (value == 'logout') {
+        if (value == 'logout') {
           try {
             await FirebaseAuth.instance.signOut();
             if (!context.mounted) return;
@@ -811,17 +876,11 @@ class _ProfileMenu extends ConsumerWidget {
           }
         }
       },
-      itemBuilder: (ctx) => [
-        const PopupMenuItem(value: 'profile', child: ListTile(leading: Icon(Icons.person_outline), title: Text('Profile'))),
-        const PopupMenuItem(value: 'settings', child: ListTile(leading: Icon(Icons.settings_outlined), title: Text('Settings'))),
-        const PopupMenuDivider(),
-        // Debug role switching (local override)
-        const PopupMenuItem(value: 'debug_engineer', child: ListTile(leading: Icon(Icons.engineering), title: Text('[Debug] Engineer View'))),
-        const PopupMenuItem(value: 'debug_nurse', child: ListTile(leading: Icon(Icons.local_hospital), title: Text('[Debug] Nurse View'))),
-        const PopupMenuItem(value: 'debug_admin', child: ListTile(leading: Icon(Icons.admin_panel_settings), title: Text('[Debug] Admin View'))),
-        const PopupMenuItem(value: 'debug_clear', child: ListTile(leading: Icon(Icons.clear), title: Text('[Debug] Clear Override'))),
-        const PopupMenuDivider(),
-        const PopupMenuItem(value: 'logout', child: ListTile(leading: Icon(Icons.logout), title: Text('Logout'))),
+      itemBuilder: (ctx) => const [
+        PopupMenuItem(value: 'profile', child: ListTile(leading: Icon(Icons.person_outline), title: Text('Profile'))),
+        PopupMenuItem(value: 'settings', child: ListTile(leading: Icon(Icons.settings_outlined), title: Text('Settings'))),
+        PopupMenuDivider(),
+        PopupMenuItem(value: 'logout', child: ListTile(leading: Icon(Icons.logout), title: Text('Logout'))),
       ],
       child: CircleAvatar(
         radius: 16,
@@ -916,8 +975,8 @@ class _NurseSideNav extends StatelessWidget {
   Widget build(BuildContext context) {
     final items = const [
       _SideItem(Icons.dashboard_outlined, 'Overview'),
-      _SideItem(Icons.build_outlined, 'Requests'),
-      _SideItem(Icons.event_available_outlined, 'Maintenance'),
+      _SideItem(Icons.report_gmailerrorred_outlined, 'Requests'),
+      _SideItem(Icons.checklist_outlined, 'Tasks'),
       _SideItem(Icons.history, 'History'),
       _SideItem(Icons.person_outline, 'Profile'),
       _SideItem(Icons.menu_book_outlined, 'Knowledge'),
@@ -946,8 +1005,6 @@ class _NurseSideNav extends StatelessWidget {
                 Navigator.of(context).pushNamed('/equipment');
               } else if (it.label == 'Knowledge') {
                 Navigator.of(context).pushNamed('/knowledge');
-              } else if (it.label == 'Maintenance') {
-                Navigator.of(context).pushNamed('/maintenance');
               } else {
                 onSelect(idx);
               }

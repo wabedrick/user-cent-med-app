@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../theme.dart';
-import '../main.dart' show debugRoleOverrideProvider; // Auth screens split
 import '../auth/sign_in_screen.dart';
 // Removed shared DashboardShell; using dedicated header + sidebar for Engineer
 import '../repositories/repair_requests_repository.dart';
@@ -843,20 +842,11 @@ class _EngineerProfileMenu extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final email = FirebaseAuth.instance.currentUser?.email;
     final initial = (email != null && email.isNotEmpty) ? email.characters.first.toUpperCase() : null;
-    return PopupMenuButton<String>(
+  return PopupMenuButton<String>(
       tooltip: 'Account',
       position: PopupMenuPosition.under,
       onSelected: (value) async {
-        if (value == 'debug_nurse') {
-          ref.read(debugRoleOverrideProvider).setRole('nurse');
-          return;
-        } else if (value == 'debug_admin') {
-          ref.read(debugRoleOverrideProvider).setRole('admin');
-          return;
-        } else if (value == 'debug_clear') {
-          ref.read(debugRoleOverrideProvider).clear();
-          return;
-        } else if (value == 'logout') {
+        if (value == 'logout') {
           try {
             await FirebaseAuth.instance.signOut();
             if (!context.mounted) return;
@@ -874,10 +864,6 @@ class _EngineerProfileMenu extends ConsumerWidget {
       itemBuilder: (ctx) => const [
         PopupMenuItem(value: 'profile', child: ListTile(leading: Icon(Icons.person_outline), title: Text('Profile'))),
         PopupMenuItem(value: 'settings', child: ListTile(leading: Icon(Icons.settings_outlined), title: Text('Settings'))),
-        PopupMenuDivider(),
-        PopupMenuItem(value: 'debug_nurse', child: ListTile(leading: Icon(Icons.local_hospital), title: Text('[Debug] Nurse View'))),
-        PopupMenuItem(value: 'debug_admin', child: ListTile(leading: Icon(Icons.admin_panel_settings), title: Text('[Debug] Admin View'))),
-        PopupMenuItem(value: 'debug_clear', child: ListTile(leading: Icon(Icons.clear), title: Text('[Debug] Clear Override'))),
         PopupMenuDivider(),
         PopupMenuItem(value: 'logout', child: ListTile(leading: Icon(Icons.logout), title: Text('Logout'))),
       ],
