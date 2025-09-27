@@ -11,7 +11,8 @@
         "roles:set-email": "node scripts/role_manager.js set-role-email",
         "roles:bootstrap": "node scripts/role_manager.js bootstrap",
         "roles:boostrap": "npm run roles:bootstrap --",
-        "roles:audit": "node scripts/role_manager.js audit-logs"
+        "roles:audit": "node scripts/role_manager.js audit-logs",
+        "fix:role-requests": "node scripts/fix_role_requests.js"
     },
     "dependencies": {
         "firebase-admin": "^12.0.0"

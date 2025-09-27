@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'dart:async'; // Timer
+import '../providers/consult_providers.dart';
+import '../models/consult_request_model.dart';
+import '../main.dart' show pendingConsultNavigationProvider;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../theme.dart';
@@ -10,6 +14,11 @@ import '../models/repair_request_model.dart';
 import '../repositories/user_repository.dart';
 import '../repositories/equipment_repository.dart';
 import '../widgets/error_utils.dart';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import '../repositories/feed_repository.dart';
 
 // Mock providers for engineer dashboard (later replace with Firestore queries)
 final engineerWorkOrdersProvider = FutureProvider<List<EngineerWorkOrderSummary>>((ref) async {
@@ -46,7 +55,8 @@ class EngineerStats {
 }
 
 class EngineerDashboardScreen extends ConsumerStatefulWidget {
-  const EngineerDashboardScreen({super.key});
+  final String? pendingConsultId;
+  const EngineerDashboardScreen({super.key, this.pendingConsultId});
   @override
   ConsumerState<EngineerDashboardScreen> createState() => _EngineerDashboardScreenState();
 }
@@ -55,7 +65,7 @@ class _EngineerDashboardScreenState extends ConsumerState<EngineerDashboardScree
   int tab = 0;
   @override
   Widget build(BuildContext context) {
-    final titles = const ['Dashboard', 'Orders', 'History', 'Profile'];
+  final titles = const ['Dashboard', 'Orders', 'Consults', 'History', 'Profile'];
     final title = titles[(tab >= 0 && tab < titles.length) ? tab : 0];
     final width = MediaQuery.of(context).size.width;
     final isNarrow = width < 900;
@@ -93,7 +103,7 @@ class _EngineerDashboardScreenState extends ConsumerState<EngineerDashboardScree
                     showMenu: isNarrow,
                   ),
                   const Divider(height: 1),
-                  Expanded(child: _EngineerBody(tab: tab)),
+                  Expanded(child: _EngineerBody(tab: tab, onChangeTab: (i)=>setState(()=>tab=i))),
                 ],
               ),
             ),
@@ -106,39 +116,37 @@ class _EngineerDashboardScreenState extends ConsumerState<EngineerDashboardScree
 
 class _EngineerBody extends ConsumerWidget {
   final int tab;
-  const _EngineerBody({required this.tab});
+  final void Function(int)? onChangeTab;
+  const _EngineerBody({required this.tab, this.onChangeTab});
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final stats = ref.watch(engineerStatsProvider);
     final orders = ref.watch(engineerWorkOrdersProvider);
     final width = MediaQuery.of(context).size.width;
     final isWide = width >= 1100;
-
     Widget statsGrid() {
       return stats.when(
         data: (s) {
-          final cards = [
+          final cards = <Widget>[
             _StatCard(label: 'Open Orders', value: s.openOrders.toString(), icon: Icons.build_circle_outlined, color: AppColors.primary),
             _StatCard(label: 'Due Today', value: s.dueToday.toString(), icon: Icons.today_outlined, color: AppColors.warning),
             _StatCard(label: 'SLA Risk', value: s.slaRisk.toString(), icon: Icons.report_problem_outlined, color: AppColors.error),
             _StatCard(label: 'Completed (Week)', value: s.completedThisWeek.toString(), icon: Icons.task_alt, color: AppColors.success),
           ];
-          List<Widget> rows = [];
-          for (var i = 0; i < cards.length; i += 2) {
-            final rowChildren = <Widget>[Expanded(child: cards[i])];
-            if (i + 1 < cards.length) {
-              rowChildren.add(const SizedBox(width: 18));
-              rowChildren.add(Expanded(child: cards[i + 1]));
-            } else {
-              rowChildren.add(const Spacer());
+          final rows = <Widget>[];
+            for (var i = 0; i < cards.length; i += 2) {
+              final rowChildren = <Widget>[Expanded(child: cards[i])];
+              if (i + 1 < cards.length) {
+                rowChildren.add(const SizedBox(width: 18));
+                rowChildren.add(Expanded(child: cards[i + 1]));
+              }
+              rows.add(Row(children: rowChildren));
+              if (i + 2 < cards.length) rows.add(const SizedBox(height: 18));
             }
-            rows.add(Row(children: rowChildren));
-            if (i + 2 < cards.length) rows.add(const SizedBox(height: 18));
-          }
           return Column(children: rows);
         },
         loading: () => const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator())),
-  error: (e, _) => _ErrorInline(message: friendlyMessageFor(e), onRetry: () => ref.invalidate(engineerStatsProvider)),
+        error: (e, _) => _ErrorInline(message: friendlyMessageFor(e), onRetry: () => ref.invalidate(engineerStatsProvider)),
       );
     }
 
@@ -162,8 +170,11 @@ class _EngineerBody extends ConsumerWidget {
                   itemBuilder: (ctx, i) => _OrderTile(item: list[i]),
                 ),
         ),
-        loading: () => const Padding(padding: EdgeInsets.symmetric(vertical: 40), child: Center(child: CircularProgressIndicator())),
-  error: (e, _) => _ErrorInline(message: friendlyMessageFor(e), onRetry: () => ref.invalidate(engineerWorkOrdersProvider)),
+        loading: () => const Padding(
+          padding: EdgeInsets.symmetric(vertical: 40),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+        error: (e, _) => _ErrorInline(message: friendlyMessageFor(e), onRetry: () => ref.invalidate(engineerWorkOrdersProvider)),
       );
     }
 
@@ -177,6 +188,8 @@ class _EngineerBody extends ConsumerWidget {
             const SizedBox(height: 18),
             statsGrid(),
             const SizedBox(height: 40),
+            _MiniConsultsPreview(onViewAll: () { onChangeTab?.call(2); }),
+            const SizedBox(height: 32),
             Row(
               children: [
                 Text('Active Work Orders', style: Theme.of(context).textTheme.titleLarge),
@@ -202,17 +215,253 @@ class _EngineerBody extends ConsumerWidget {
 
     Widget placeholder(String title) => Center(child: Text('$title (static)', style: Theme.of(context).textTheme.titleLarge));
     switch (tab) {
-      case 0:
-        return dashboard();
-      case 1:
-        return const _EngineerOrdersTab();
-      case 2:
-        return placeholder('History');
-      case 3:
-        return placeholder('Profile');
-      default:
-        return dashboard();
+      case 0: return dashboard();
+      case 1: return const _EngineerOrdersTab();
+      case 2: return const _EngineerConsultsTab();
+      case 3: return placeholder('History');
+      case 4: return placeholder('Profile');
+      default: return dashboard();
     }
+  }
+}
+
+class _EngineerConsultsTab extends ConsumerStatefulWidget {
+  const _EngineerConsultsTab();
+  @override
+  ConsumerState<_EngineerConsultsTab> createState() => _EngineerConsultsTabState();
+}
+
+class _EngineerConsultsTabState extends ConsumerState<_EngineerConsultsTab> {
+  final listKey = GlobalKey();
+  DateTime? _highlightExpiresAt;
+  Timer? _highlightTimer;
+
+  @override
+  void dispose() {
+    _highlightTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final open = ref.watch(openConsultsProvider);
+  final pendingId = ref.watch(pendingConsultNavigationProvider);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('Consult Requests', style: Theme.of(context).textTheme.headlineSmall),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Refresh',
+                onPressed: () => ref.invalidate(openConsultsProvider),
+                icon: const Icon(Icons.refresh),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: open.when(
+              data: (list) {
+                if (list.isEmpty) return const Center(child: Text('No open or active consults'));
+                // After first frame, if pendingId present, scroll to it then clear & set highlight timer.
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (pendingId != null) {
+                    final index = list.indexWhere((c) => c.id == pendingId);
+                    if (index >= 0) {
+                      Scrollable.ensureVisible(
+                        _EngineerConsultCard.globalKeyFor(list[index].id).currentContext!,
+                        duration: const Duration(milliseconds: 400),
+                        curve: Curves.easeInOut,
+                      );
+                      // Setup highlight expiry (4s)
+                      _highlightExpiresAt = DateTime.now().add(const Duration(seconds: 4));
+                      _highlightTimer?.cancel();
+                      _highlightTimer = Timer(const Duration(seconds: 4), () { if (mounted) setState(() {}); });
+                      ref.read(pendingConsultNavigationProvider.notifier).clear();
+                    }
+                  }
+                });
+                return ListView.separated(
+                  key: listKey,
+                  itemCount: list.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (ctx, i) {
+                    final highlightActive = pendingId != null && list[i].id == pendingId && (_highlightExpiresAt == null || DateTime.now().isBefore(_highlightExpiresAt!));
+                    return _EngineerConsultCard(item: list[i], highlight: highlightActive);
+                  },
+                );
+              },
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (e, _) => Center(child: Text('Error: $e')),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EngineerConsultCard extends ConsumerWidget {
+  final ConsultRequest item;
+  final bool highlight;
+  const _EngineerConsultCard({required this.item, this.highlight = false});
+  static GlobalKey globalKeyFor(String id) => GlobalObjectKey('_consult_$id');
+  Color _statusColor(String s) {
+    switch (s) {
+      case 'open': return Colors.orange.shade600;
+      case 'claimed': return Colors.amber.shade800;
+      case 'answered': return Colors.green.shade600;
+      case 'closed': return Colors.blueGrey;
+      default: return Colors.grey;
+    }
+  }
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final user = FirebaseAuth.instance.currentUser;
+    final isClaimer = user != null && item.claimedBy == user.uid;
+    final repo = ref.read(consultRepositoryProvider);
+    final cardKey = globalKeyFor(item.id);
+  // Local relative time formatter (lint: no leading underscore for local identifiers)
+  String formatRelativeTime(DateTime ts) {
+      final now = DateTime.now();
+      final diff = now.difference(ts);
+      if (diff.inSeconds < 60) return '${diff.inSeconds}s ago';
+      if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+      if (diff.inHours < 24) return '${diff.inHours}h ago';
+      return '${diff.inDays}d ago';
+    }
+    return AnimatedContainer(
+      key: cardKey,
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOut,
+      decoration: BoxDecoration(
+        color: highlight ? Colors.yellow.shade100 : Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: highlight ? Colors.amber.shade400 : Colors.grey.shade300),
+        boxShadow: highlight
+            ? [BoxShadow(color: Colors.amber.withValues(alpha: 0.3), blurRadius: 16, offset: const Offset(0,4))]
+            : [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 10, offset: const Offset(0,3))],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: _statusColor(item.status).withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(30),
+                  ),
+                  child: Text(item.status.toUpperCase(), style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: _statusColor(item.status))),
+                ),
+                const Spacer(),
+                Text(formatRelativeTime(item.createdAt), style: const TextStyle(fontSize: 11, color: Colors.black54)),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(item.question, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+            if (item.answer != null && item.answer!.trim().isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.green.shade50,
+                  border: Border.all(color: Colors.green.shade200),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.engineering_outlined, size: 18, color: Colors.green),
+                    const SizedBox(width: 10),
+                    Expanded(child: Text(item.answer!, style: const TextStyle(fontSize: 13))),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                if (item.status == 'open')
+                  FilledButton(
+                    onPressed: user == null ? null : () async { await repo.claim(item.id, user.uid); },
+                    child: const Text('Claim'),
+                  ),
+                if (isClaimer && item.status == 'claimed')
+                  FilledButton(
+                    onPressed: () async {
+                      final answer = await showDialog<String>(context: context, builder: (_) => const _AnswerConsultDialog());
+                      if (answer != null && answer.trim().isNotEmpty) {
+                        await repo.answer(item.id, user.uid, answer.trim());
+                      }
+                    },
+                    style: FilledButton.styleFrom(backgroundColor: Colors.green.shade600),
+                    child: const Text('Answer'),
+                  ),
+                if (isClaimer && item.status == 'answered')
+                  OutlinedButton(
+                    onPressed: () async { await repo.close(item.id); },
+                    child: const Text('Close'),
+                  ),
+                const Spacer(),
+                if (item.claimedBy != null)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.engineering_outlined, size: 16, color: Colors.black54),
+                      const SizedBox(width: 4),
+                      Text(isClaimer ? 'You' : 'Engineer', style: const TextStyle(fontSize: 11, color: Colors.black54)),
+                    ],
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AnswerConsultDialog extends StatefulWidget {
+  const _AnswerConsultDialog();
+  @override
+  State<_AnswerConsultDialog> createState() => _AnswerConsultDialogState();
+}
+
+class _AnswerConsultDialogState extends State<_AnswerConsultDialog> {
+  final _controller = TextEditingController();
+  bool _submitting = false;
+  @override
+  void dispose() { _controller.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Provide Answer'),
+      content: TextField(
+        controller: _controller,
+        maxLines: 5,
+        decoration: const InputDecoration(hintText: 'Type your answer...'),
+      ),
+      actions: [
+        TextButton(onPressed: _submitting ? null : () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: _submitting ? null : () async {
+            final text = _controller.text.trim();
+            if (text.isEmpty) return;
+            setState(() => _submitting = true);
+            Navigator.pop(context, text);
+          },
+          child: _submitting ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Submit'),
+        ),
+      ],
+    );
   }
 }
 
@@ -617,43 +866,159 @@ class _EngineerRightPanel extends StatelessWidget {
         border: const Border(left: BorderSide(color: AppColors.outline)),
         boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 12, offset: const Offset(-2, 0))],
       ),
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(24, 32, 24, 32),
-        children: const [
-          _PanelSection(title: 'Quick Actions', children: [
-            _QuickAction(icon: Icons.add_circle_outline, label: 'New Work Order'),
-            _QuickAction(icon: Icons.qr_code_scanner, label: 'Scan Asset'),
-            _QuickAction(icon: Icons.inventory_2_outlined, label: 'Parts Catalogue'),
-          ]),
-          SizedBox(height: 32),
-          _PanelSection(title: 'Reminders', children: [
-            _ReminderChip(text: 'Replace MRI coolant filter'),
-            _ReminderChip(text: 'Audit ventilators Friday'),
-            _ReminderChip(text: 'Patch firmware (3 devices)'),
-          ]),
-        ],
-      ),
+      child: _EngineerRightPanelContent(),
+    );
+  }
+}
+
+class _EngineerRightPanelContent extends ConsumerStatefulWidget {
+  @override
+  ConsumerState<_EngineerRightPanelContent> createState() => _EngineerRightPanelContentState();
+}
+
+class _EngineerRightPanelContentState extends ConsumerState<_EngineerRightPanelContent> {
+  final _captionCtrl = TextEditingController();
+  List<PlatformFile> _pickedImages = [];
+  bool _posting = false;
+
+  @override
+  void dispose() {
+    _captionCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickImages() async {
+    final res = await FilePicker.platform.pickFiles(type: FileType.image, allowMultiple: true);
+    if (res != null) setState(() => _pickedImages = res.files);
+  }
+
+  Future<void> _publishPost() async {
+    if (_posting) return;
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    if (_pickedImages.isEmpty && _captionCtrl.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Add an image or write a caption.')));
+      return;
+    }
+    setState(() => _posting = true);
+    try {
+      final storage = FirebaseStorage.instance;
+      final urls = <String>[];
+      for (final f in _pickedImages) {
+        if (f.path == null && f.bytes == null) continue;
+        final ref = storage.ref('posts/${user.uid}/${DateTime.now().millisecondsSinceEpoch}_${f.name}');
+        final Uint8List data = f.bytes ?? await File(f.path!).readAsBytes();
+        await ref.putData(data, SettableMetadata(contentType: 'image/jpeg'));
+        urls.add(await ref.getDownloadURL());
+      }
+      // Derive simple handle: last word of displayName or email local-part.
+      // Try to pull persisted username from Firestore user doc via provider for stronger consistency
+      String authorHandle;
+      try {
+        final u = ref.read(userByIdProvider(user.uid)).value;
+        if (u?.username != null && u!.username!.isNotEmpty) {
+          authorHandle = u.username!;
+        } else {
+          final raw = (user.displayName ?? user.email ?? '').trim();
+          final parts = raw.split(RegExp(r'\s+'));
+          String handleBase = parts.isNotEmpty ? parts.last : raw;
+          if (handleBase.contains('@')) handleBase = handleBase.split('@').first;
+          authorHandle = handleBase.isEmpty ? 'user' : handleBase.toLowerCase();
+        }
+      } catch (_) {
+        final raw = (user.displayName ?? user.email ?? '').trim();
+        final parts = raw.split(RegExp(r'\s+'));
+        String handleBase = parts.isNotEmpty ? parts.last : raw;
+        if (handleBase.contains('@')) handleBase = handleBase.split('@').first;
+        authorHandle = handleBase.isEmpty ? 'user' : handleBase.toLowerCase();
+      }
+      await ref.read(feedRepositoryProvider).createImagePost(
+        authorId: user.uid,
+        authorName: user.displayName ?? (user.email ?? 'Engineer'),
+        authorHandle: authorHandle,
+        authorAvatarUrl: user.photoURL,
+        caption: _captionCtrl.text.trim(),
+        imageUrls: urls,
+      );
+      if (!mounted) return;
+      setState(() { _pickedImages = []; _captionCtrl.clear(); });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Post published')));
+    } catch (e) {
+      if (mounted) showFriendlyError(context, e, fallback: 'Could not publish.');
+    } finally {
+      if (mounted) setState(() => _posting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+      children: [
+        Text('Share to feed', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        TextField(
+          controller: _captionCtrl,
+          maxLines: 3,
+          decoration: const InputDecoration(hintText: 'Write a caption…', border: OutlineInputBorder()),
+        ),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (final img in _pickedImages)
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(border: Border.all(color: AppColors.outline), borderRadius: BorderRadius.circular(8)),
+              clipBehavior: Clip.antiAlias,
+              child: (img.bytes != null)
+                  ? Image.memory(img.bytes!, width: 64, height: 64, fit: BoxFit.cover)
+                  : (img.path != null)
+                      ? Image.file(File(img.path!), width: 64, height: 64, fit: BoxFit.cover)
+                      : const Icon(Icons.image_outlined, color: AppColors.primaryLight),
+            ),
+          OutlinedButton.icon(onPressed: _pickImages, icon: const Icon(Icons.image_outlined), label: const Text('Add images')),
+        ]),
+        const SizedBox(height: 8),
+        FilledButton.icon(onPressed: _posting ? null : _publishPost, icon: const Icon(Icons.send), label: const Text('Post')),
+        const SizedBox(height: 24),
+        const Divider(),
+        const SizedBox(height: 16),
+        const _PanelSection(title: 'Quick Actions', children: [
+          _QuickAction(icon: Icons.add_circle_outline, label: 'New Work Order'),
+          _QuickAction(icon: Icons.qr_code_scanner, label: 'Scan Asset'),
+          _QuickAction(icon: Icons.inventory_2_outlined, label: 'Parts Catalogue'),
+        ]),
+        const SizedBox(height: 32),
+        const _PanelSection(title: 'Reminders', children: [
+          _ReminderChip(text: 'Replace MRI coolant filter'),
+          _ReminderChip(text: 'Audit ventilators Friday'),
+          _ReminderChip(text: 'Patch firmware (3 devices)'),
+        ]),
+      ],
     );
   }
 }
 
 // Legacy side nav removed (DashboardShell provides side navigation)
 // Dedicated side navigation for Engineer dashboard
-class _EngineerSideNav extends StatelessWidget {
+class _EngineerSideNav extends ConsumerWidget {
   final int currentIndex;
   final ValueChanged<int> onSelect;
   const _EngineerSideNav({required this.currentIndex, required this.onSelect});
 
   @override
-  Widget build(BuildContext context) {
-    final items = const [
-      _SideItem(Icons.dashboard_outlined, 'Dashboard'),
-      _SideItem(Icons.list_alt_outlined, 'Orders'),
-      _SideItem(Icons.event_available_outlined, 'Maintenance'),
-      _SideItem(Icons.history, 'History'),
-      _SideItem(Icons.person_outline, 'Profile'),
-      _SideItem(Icons.menu_book_outlined, 'Knowledge'),
-      _SideItem(Icons.precision_manufacturing_outlined, 'Equipment'),
+  Widget build(BuildContext context, WidgetRef ref) {
+    final openConsults = ref.watch(openConsultsProvider).maybeWhen(data: (list) => list.length, orElse: () => null);
+    // Tab order must match _EngineerBody switch: 0 Dashboard,1 Orders,2 Consults,3 History,4 Profile
+    final items = <_SideItem>[
+      const _SideItem(Icons.dashboard_outlined, 'Dashboard'),
+      const _SideItem(Icons.list_alt_outlined, 'Orders'),
+      const _SideItem(Icons.chat_bubble_outline, 'Consults'),
+      const _SideItem(Icons.history, 'History'),
+      const _SideItem(Icons.person_outline, 'Profile'),
+      const _SideItem(Icons.menu_book_outlined, 'Knowledge'), // external nav
+      const _SideItem(Icons.precision_manufacturing_outlined, 'Equipment'), // external nav
+      const _SideItem(Icons.event_available_outlined, 'Maintenance'), // external nav
     ];
     return Container(
       decoration: const BoxDecoration(
@@ -669,46 +1034,61 @@ class _EngineerSideNav extends StatelessWidget {
               child: Text('Engineer', style: GoogleFonts.montserrat(fontWeight: FontWeight.w700, fontSize: 16, color: AppColors.primary)),
             );
           }
-          final idx = i - 1;
-          final it = items[idx];
-          final selected = idx == currentIndex;
-          return InkWell(
-            onTap: () {
-              if (it.label == 'Equipment') {
-                Navigator.of(context).pushNamed('/equipment');
-              } else if (it.label == 'Knowledge') {
+            final idx = i - 1;
+            final it = items[idx];
+            // Internal tab indices are first 5 items (Dashboard..Profile); others navigate.
+            final isInternalTab = idx <= 4;
+            final selected = isInternalTab && idx == currentIndex;
+            void handleTap() {
+              if (it.label == 'Knowledge') {
                 Navigator.of(context).pushNamed('/knowledge');
+              } else if (it.label == 'Equipment') {
+                Navigator.of(context).pushNamed('/equipment');
               } else if (it.label == 'Maintenance') {
                 Navigator.of(context).pushNamed('/maintenance');
-              } else {
+              } else if (isInternalTab) {
                 onSelect(idx);
               }
-            },
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-              decoration: BoxDecoration(
-                color: selected ? AppColors.primary.withValues(alpha: 0.08) : Colors.transparent,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Row(
-                children: [
-                  Icon(it.icon, color: selected ? AppColors.primary : AppColors.primaryDark),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      it.label,
-                      style: GoogleFonts.sourceSans3(
-                        fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
-                        color: selected ? AppColors.primary : AppColors.primaryDark,
+            }
+            return InkWell(
+              onTap: handleTap,
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                decoration: BoxDecoration(
+                  color: selected ? AppColors.primary.withValues(alpha: 0.08) : Colors.transparent,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    Icon(it.icon, color: selected ? AppColors.primary : AppColors.primaryDark),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        it.label,
+                        style: GoogleFonts.sourceSans3(
+                          fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
+                          color: selected ? AppColors.primary : AppColors.primaryDark,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
-                      overflow: TextOverflow.ellipsis,
                     ),
-                  ),
-                ],
+                    if (it.label == 'Consults' && openConsults != null && openConsults > 0)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: AppColors.error,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          openConsults > 99 ? '99+' : openConsults.toString(),
+                          style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                  ],
+                ),
               ),
-            ),
-          );
+            );
         },
       ),
     );
@@ -735,6 +1115,145 @@ class _PanelSection extends StatelessWidget {
         const SizedBox(height: 16),
         Wrap(runSpacing: 12, spacing: 12, children: children),
       ],
+    );
+  }
+}
+
+// Mini panel showing top few open consults
+class _MiniConsultsPreview extends ConsumerWidget {
+  final VoidCallback onViewAll;
+  const _MiniConsultsPreview({required this.onViewAll});
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final consultsAsync = ref.watch(openConsultsProvider);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text('Open Consults', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(width: 12),
+            consultsAsync.when(
+              data: (list) => AnimatedOpacity(
+                opacity: 1,
+                duration: const Duration(milliseconds: 300),
+                child: Text('${list.length}', style: TextStyle(color: AppColors.primaryDark, fontWeight: FontWeight.w600)),
+              ),
+              loading: () => const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+              error: (e, _) => Tooltip(message: e.toString(), child: const Icon(Icons.error_outline, color: Colors.red, size: 16)),
+            ),
+            const Spacer(),
+            TextButton(onPressed: onViewAll, child: const Text('View All')),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            border: Border.all(color: AppColors.outline),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
+          child: consultsAsync.when(
+            data: (list) {
+              if (list.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 4),
+                  child: Text('No open consults', style: TextStyle(color: Colors.black54)),
+                );
+              }
+              final top = list.take(3).toList();
+              return Column(
+                children: [
+                  for (var c in top) _MiniConsultRow(c: c),
+                  if (list.length > 3)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text('+${list.length - 3} more', style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                      ),
+                    )
+                ],
+              );
+            },
+            loading: () => const SizedBox(height: 48, child: Center(child: CircularProgressIndicator(strokeWidth: 2))),
+            error: (e, _) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text('Error loading consults', style: TextStyle(color: Colors.red.shade700, fontSize: 13)),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _MiniConsultRow extends ConsumerWidget {
+  final ConsultRequest c;
+  const _MiniConsultRow({required this.c});
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final repo = ref.read(consultRepositoryProvider);
+    final user = FirebaseAuth.instance.currentUser;
+    final isClaimed = c.claimedBy != null;
+    final canClaim = !isClaimed && user != null;
+    Color badgeColor() {
+      switch (c.status) {
+        case 'open': return Colors.orange.shade600;
+        case 'claimed': return Colors.amber.shade800;
+        case 'answered': return Colors.green.shade600;
+        default: return Colors.grey;
+      }
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: badgeColor().withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(30),
+            ),
+            child: Text(c.status.toUpperCase(), style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: badgeColor())),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(c.question, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                if (c.answer != null && c.answer!.trim().isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(c.answer!, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: Colors.black87)),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          Builder(builder: (ctx){
+            if (canClaim) {
+              return TextButton(
+                onPressed: () async { final u = user; if (u != null) await repo.claim(c.id, u.uid); },
+                child: const Text('Claim'),
+              );
+            }
+            if (user != null && c.status == 'claimed' && c.claimedBy == user.uid) {
+              return TextButton(
+                onPressed: () { ref.read(pendingConsultNavigationProvider.notifier).set(c.id); },
+                child: const Text('View'),
+              );
+            }
+            return TextButton(
+              onPressed: () { ref.read(pendingConsultNavigationProvider.notifier).set(c.id); },
+              child: const Text('Open'),
+            );
+          }),
+        ],
+      ),
     );
   }
 }

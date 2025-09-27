@@ -6,10 +6,9 @@ import '../auth/role_service.dart';
 import '../auth/claim_sync_manager.dart';
 import '../auth/auth_log.dart';
 // (Legacy role provider import no longer needed here)
-import '../widgets/role_gate.dart';
 import '../dashboard/admin_dashboard.dart';
 import '../dashboard/engineer_dashboard.dart';
-import '../dashboard/nurse_dashboard.dart';
+import '../dashboard/user_dashboard.dart';
 import 'sign_in_screen.dart';
 import '../widgets/error_utils.dart';
 
@@ -106,19 +105,19 @@ class _UnifiedAuthGateState extends ConsumerState<UnifiedAuthGate> {
           loading: () => const _RoleLoading(),
           error: (e, _) => Scaffold(body: FriendlyErrorView(error: e, title: 'Couldn’t determine your access', onRetry: () => _resolveRole(forceClaim: true))),
           data: (role) {
-            if (role == null) {
-              return _StalledRole(onRetry: () => _resolveRole(forceClaim: true));
-            }
+            // Any signed-in user gets the general User Dashboard by default.
+            // Only confirmed engineers (or admins) see Engineer, and admins see Admin.
             switch (role) {
               case 'admin':
-                return RoleGate(allow: const ['admin'], builder: (_, __) => const AdminDashboardScreen());
+                return const AdminDashboardScreen();
               case 'engineer':
-                return RoleGate(allow: const ['engineer','admin'], builder: (_, __) => const EngineerDashboardScreen());
-              case 'nurse': // legacy
+                return const EngineerDashboardScreen();
+              case 'nurse': // legacy labels map to User dashboard
               case 'medic':
-                return RoleGate(allow: const ['nurse','medic','admin'], builder: (_, __) => const NurseDashboardScreen());
+                return const UserDashboardScreen();
               default:
-                return _StalledRole(onRetry: () => _resolveRole(forceClaim: true));
+                // Unknown or missing role: show User Dashboard (safe default)
+                return const UserDashboardScreen();
             }
           },
         );
@@ -131,34 +130,6 @@ class _RoleLoading extends StatelessWidget {
   const _RoleLoading();
   @override
   Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
-}
-
-class _StalledRole extends StatelessWidget {
-  final VoidCallback onRetry;
-  const _StalledRole({required this.onRetry});
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(height: 12),
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 32.0),
-              child: Text('Resolving your access role… If this takes too long you can retry or sign out.' , textAlign: TextAlign.center),
-            ),
-            const SizedBox(height: 16),
-            Wrap(spacing: 12, children: [
-              ElevatedButton(onPressed: onRetry, child: const Text('Retry')),
-              ElevatedButton(onPressed: () async { try { await fa.FirebaseAuth.instance.signOut(); } catch (_) {} }, child: const Text('Sign Out')),
-            ]),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 // (unused _ErrorScaffold removed; FriendlyErrorView is used instead)

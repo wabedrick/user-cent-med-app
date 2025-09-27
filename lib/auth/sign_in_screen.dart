@@ -4,7 +4,8 @@ import 'package:firebase_auth/firebase_auth.dart' as fa;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 
-import '../main.dart' show ensureUserDoc, TokenRefresher, RoleRouter; // reuse existing helper and router
+import '../main.dart' show ensureUserDoc; // reuse existing helper
+import 'unified_auth_gate.dart';
 import 'sign_up_screen.dart';
 
 class SignInScreen extends StatefulWidget {
@@ -92,7 +93,7 @@ class _SignInScreenState extends State<SignInScreen> {
         if (mounted) {
           // Explicitly route into the authenticated area to avoid any UI ambiguity.
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const TokenRefresher(child: RoleRouter())),
+            MaterialPageRoute(builder: (_) => const UnifiedAuthGate()),
           );
         }
       }

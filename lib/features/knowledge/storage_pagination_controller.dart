@@ -78,3 +78,4 @@ AsyncNotifierProvider<StoragePaginationController, StoragePaginationState> stora
 
 final manualsPaginatedProvider = storageFolderProvider('manuals');
 final videosPaginatedProvider = storageFolderProvider('videos');
+final imagesPaginatedProvider = storageFolderProvider('images');

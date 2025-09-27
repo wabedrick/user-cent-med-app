@@ -1,19 +1,21 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'navigation/app_navigator.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'providers/role_provider.dart' show userRoleProvider; // legacy unified role provider (will be phased out)
 import 'auth/role_service.dart';
 import 'auth/claim_sync_manager.dart';
 import 'package:firebase_auth/firebase_auth.dart' as fa;
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'firebase_options.dart';
+// media_kit global initialization (required for some platforms to ensure backends are ready)
+import 'package:media_kit/media_kit.dart';
 import 'theme.dart';
-import 'dashboard/nurse_dashboard.dart';
+import 'dashboard/user_dashboard.dart';
 import 'dashboard/engineer_dashboard.dart';
 import 'dashboard/admin_dashboard.dart';
-import 'widgets/role_gate.dart';
 // sign_in_screen imported indirectly via UnifiedAuthGate
 import 'auth/unified_auth_gate.dart';
 import 'equipment/equipment_list_page.dart';
@@ -21,18 +23,15 @@ import 'features/maintenance/maintenance_list_page.dart';
 import 'features/knowledge/knowledge_center_page.dart';
 import 'features/assistant/assistant_chat_screen.dart';
 import 'widgets/error_utils.dart';
+import 'features/video/mini_video_overlay.dart';
 // Add localization + messaging service imports
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'services/messaging_service.dart';
+// (removed duplicate imports for app_navigator & riverpod)
 
-// Configurable default role via --dart-define=DEFAULT_ROLE=engineer|nurse|admin
-const String _envDefaultRole = String.fromEnvironment('DEFAULT_ROLE');
-final String kDefaultRole = (_envDefaultRole == 'engineer' || _envDefaultRole == 'nurse' || _envDefaultRole == 'admin')
-    ? _envDefaultRole
-    : 'engineer';
-bool get kDefaultRoleIsValid => kDefaultRole == 'engineer' || kDefaultRole == 'nurse' || kDefaultRole == 'admin';
-// For self-provisioning user docs, never write 'admin' to satisfy rules; clamp to non-admin.
-String get kSafeSelfCreateRole => (kDefaultRole == 'admin') ? 'engineer' : (kDefaultRoleIsValid ? kDefaultRole : 'engineer');
+// Default role for newly registered users should be 'user'.
+// Avoid deriving from environment to prevent accidental elevation.
+const String kSafeSelfCreateRole = 'user';
 
 // Dev flag to force sign-out at launch so app opens on Sign In screen
 const String _envForceSignOut = String.fromEnvironment('FORCE_SIGNOUT');
@@ -55,6 +54,9 @@ final authStateProvider = StreamProvider<fa.User?>((ref) {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Ensure media_kit is initialized (idempotent). This can help avoid backend load races
+  // when we attempt a software decode fallback very early in app lifetime.
+  try { MediaKit.ensureInitialized(); } catch (e) { debugPrint('[media_kit] init warning: $e'); }
   String? initError;
   try {
     await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
@@ -80,6 +82,7 @@ class App extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: appNavigatorKey,
       title: 'Med Equip Manager',
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
@@ -92,7 +95,22 @@ class App extends StatelessWidget {
       supportedLocales: const [
         Locale('en'),
       ],
-  home: const UnifiedAuthGate(),
+      builder: (context, child) {
+        // Provide a global Overlay so mini-player and tooltips/menus can use it
+        return Overlay(
+          initialEntries: [
+            OverlayEntry(
+              builder: (ctx) => Stack(
+                children: [
+                  if (child != null) child,
+                  const MiniVideoOverlay(),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+      home: const UnifiedAuthGate(),
       routes: {
         '/equipment': (_) => const EquipmentListPage(),
         '/maintenance': (_) => const MaintenanceListPage(),
@@ -169,15 +187,73 @@ Future<void> ensureUserDoc(fa.User user) async {
     try {
       final snap = await doc.get().timeout(const Duration(seconds: 6), onTimeout: () => throw TimeoutException('get user doc timeout'));
       if (!snap.exists) {
+        // Derive base from last word of displayName or email local part.
+        String base = '';
+        final dn = user.displayName?.trim();
+        if (dn != null && dn.isNotEmpty) {
+          final parts = dn.split(RegExp(r'\s+'));
+            base = parts.isNotEmpty ? parts.last : dn;
+        }
+        if (base.isEmpty) {
+          final email = user.email ?? '';
+          base = email.contains('@') ? email.split('@').first : email;
+        }
+        base = base.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '').toLowerCase();
+        if (base.length < 3) base = 'user';
+        // Check for collisions; append short number if needed.
+        String candidate = base;
+        int suffix = 1;
+        while (true) {
+          final q = await users.where('username', isEqualTo: candidate).limit(1).get();
+          if (q.docs.isEmpty) break;
+          suffix++;
+          candidate = '$base$suffix';
+          if (suffix > 9999) { // safety cap
+            candidate = base + DateTime.now().millisecondsSinceEpoch.toString().substring(9);
+            break;
+          }
+        }
         await doc
             .set({
               'email': user.email,
               'displayName': user.displayName,
               'emailLower': (user.email ?? '').toLowerCase(),
               'role': kSafeSelfCreateRole,
+              'username': candidate,
               'createdAt': FieldValue.serverTimestamp(),
             })
             .timeout(const Duration(seconds: 6), onTimeout: () => throw TimeoutException('create user doc timeout'));
+      } else {
+        // Backfill username if missing (legacy accounts)
+        final data = snap.data();
+        if (data != null && (data['username'] == null || (data['username'] as String).trim().isEmpty)) {
+          String base = '';
+          final ln = (data['lastName'] as String?)?.trim();
+          if (ln != null && ln.isNotEmpty) base = ln;
+          if (base.isEmpty) {
+            final dn = (data['displayName'] as String?)?.trim();
+            if (dn != null && dn.isNotEmpty) {
+              final parts = dn.split(RegExp(r'\s+'));
+              base = parts.isNotEmpty ? parts.last : dn;
+            }
+          }
+          if (base.isEmpty) {
+            final email = user.email ?? '';
+            base = email.contains('@') ? email.split('@').first : email;
+          }
+          base = base.replaceAll(RegExp(r'[^A-Za-z0-9_]'), '').toLowerCase();
+          if (base.length < 3) base = 'user';
+          String candidate = base;
+          int suffix = 1;
+          while (true) {
+            final q = await users.where('username', isEqualTo: candidate).limit(1).get();
+            if (q.docs.isEmpty) break;
+            suffix++;
+            candidate = '$base$suffix';
+            if (suffix > 9999) { candidate = base + DateTime.now().millisecondsSinceEpoch.toString().substring(9); break; }
+          }
+          await doc.update({'username': candidate});
+        }
       }
       return;
     } on FirebaseException catch (e) {
@@ -215,6 +291,16 @@ class RoleOverrideNotifier extends ValueNotifier<String?> {
 }
 
 final debugRoleOverrideProvider = Provider<RoleOverrideNotifier>((ref) => RoleOverrideNotifier());
+
+// Holds a consultId that should be focused after navigation (e.g., from notification tap)
+// Implemented as a NotifierProvider instead of StateProvider to avoid analyzer symbol issues.
+class PendingConsultNavigation extends Notifier<String?> {
+  @override
+  String? build() => null;
+  void set(String? id) => state = id;
+  void clear() => state = null;
+}
+final pendingConsultNavigationProvider = NotifierProvider<PendingConsultNavigation, String?>(PendingConsultNavigation.new);
 
 class RoleRouter extends ConsumerStatefulWidget {
   const RoleRouter({super.key});
@@ -273,17 +359,19 @@ class _RoleRouterState extends ConsumerState<RoleRouter> {
 
   @override
   Widget build(BuildContext context) {
+    // If there is a pending consult navigation request and user is engineer/admin, ensure we route to engineer screen.
+  final pendingConsult = ref.watch(pendingConsultNavigationProvider);
     return _role.when(
       data: (role) {
         if (role == null) return const _RoleLoadingFallback();
         switch (role) {
           case 'admin':
-            return RoleGate(allow: const ['admin'], builder: (_, __) => const AdminDashboardScreen());
+            return const AdminDashboardScreen();
           case 'engineer':
-            return RoleGate(allow: const ['engineer','admin'], builder: (_, __) => const EngineerDashboardScreen());
+            return EngineerDashboardScreen(pendingConsultId: pendingConsult);
           case 'nurse': // legacy
           case 'medic':
-            return RoleGate(allow: const ['nurse','medic','admin'], builder: (_, __) => const NurseDashboardScreen());
+            return const UserDashboardScreen();
           default:
             return const _RoleLoadingFallback();
         }

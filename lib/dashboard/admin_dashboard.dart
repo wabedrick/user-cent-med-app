@@ -6,7 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../theme.dart';
-import 'nurse_dashboard.dart';
+import 'user_dashboard.dart';
 import 'engineer_dashboard.dart';
 import '../repositories/equipment_repository.dart';
 import '../models/equipment_model.dart';
@@ -15,6 +15,7 @@ import '../repositories/user_repository.dart';
 import '../providers/role_provider.dart';
 import '../auth/unified_auth_gate.dart'; // updated gate
 import '../widgets/error_utils.dart';
+import '../repositories/role_requests_repository.dart';
 
 // Toggle this to true only if you've deployed Cloud Functions with a callable
 // `setUserRole`. Otherwise, role changes should be done via the offline script.
@@ -764,12 +765,12 @@ class _RoleDashboardsLinks extends StatelessWidget {
       children: [
         ListTile(
           leading: const Icon(Icons.medical_services_outlined),
-          title: const Text('Nurse dashboard'),
-          subtitle: const Text('View the nurse workspace'),
+          title: const Text('User dashboard'),
+          subtitle: const Text('View the general user workspace'),
           trailing: const Icon(Icons.chevron_right),
           onTap: () {
             Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const NurseDashboardScreen()),
+              MaterialPageRoute(builder: (_) => const UserDashboardScreen()),
             );
           },
         ),
@@ -1707,10 +1708,103 @@ class _LiveUserRoleManagerState extends ConsumerState<_LiveUserRoleManager> {
   @override
   Widget build(BuildContext context) {
     final asyncUsers = ref.watch(usersListProvider);
+    final pending = ref.watch(pendingRoleRequestsProvider);
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // Pending role requests banner/card
+        pending.when(
+          loading: () => const LinearProgressIndicator(minHeight: 2),
+          error: (e, _) => const SizedBox.shrink(),
+          data: (list) {
+            if (list.isEmpty) return const SizedBox.shrink();
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.pending_actions, color: AppColors.primary),
+                        const SizedBox(width: 8),
+                        Text('Pending role requests (${list.length})', style: Theme.of(context).textTheme.titleMedium),
+                        const Spacer(),
+                        IconButton(tooltip: 'Refresh', onPressed: () => ref.invalidate(pendingRoleRequestsProvider), icon: const Icon(Icons.refresh)),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ListView.separated(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      itemCount: list.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (ctx, i) {
+                        final r = list[i];
+                        final uid = (r['uid'] ?? r['id'] ?? '').toString();
+                        final email = (r['email'] ?? '').toString();
+                        final name = (r['displayName'] ?? '').toString();
+                        final reqRole = (r['requestedRole'] ?? 'engineer').toString();
+                        return ListTile(
+                          leading: const Icon(Icons.how_to_reg_outlined),
+                          title: Text(email.isNotEmpty ? email : uid, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          subtitle: Text(name.isNotEmpty ? '$name • $reqRole' : reqRole),
+                          trailing: Wrap(spacing: 8, children: [
+                            OutlinedButton(
+                              onPressed: () async {
+                                try {
+                                  // Approve: set role to requestedRole, then mark approved
+                                  final repo = ref.read(userRepositoryProvider);
+                                  await repo.updateUserRole(uid: uid, newRole: reqRole, callFunction: kEnableRoleChangeViaFunctions);
+                                  await ref.read(roleRequestsRepositoryProvider).markApproved(uid: uid, adminUid: currentUid ?? '');
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Approved $uid as $reqRole')));
+                                  }
+                                } catch (e) {
+                                  if (context.mounted) showFriendlyError(context, e, fallback: 'Approve failed');
+                                }
+                              },
+                              child: const Text('Approve'),
+                            ),
+                            TextButton(
+                              onPressed: () async {
+                                final reason = await showDialog<String>(
+                                  context: context,
+                                  builder: (dCtx) {
+                                    final ctrl = TextEditingController();
+                                    return AlertDialog(
+                                      title: const Text('Deny request'),
+                                      content: TextField(controller: ctrl, decoration: const InputDecoration(labelText: 'Reason (optional)')),
+                                      actions: [
+                                        TextButton(onPressed: () => Navigator.of(dCtx).pop(), child: const Text('Cancel')),
+                                        FilledButton(onPressed: () => Navigator.of(dCtx).pop(ctrl.text.trim()), child: const Text('Deny')),
+                                      ],
+                                    );
+                                  },
+                                );
+                                try {
+                                  await ref.read(roleRequestsRepositoryProvider).markDenied(uid: uid, adminUid: currentUid ?? '', reason: (reason?.isEmpty ?? true) ? null : reason);
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Denied request for $uid')));
+                                  }
+                                } catch (e) {
+                                  if (context.mounted) showFriendlyError(context, e, fallback: 'Deny failed');
+                                }
+                              },
+                              child: const Text('Deny'),
+                            ),
+                          ]),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
         Row(
           children: [
             Expanded(child: Text('User Role Management', style: Theme.of(context).textTheme.titleLarge)),

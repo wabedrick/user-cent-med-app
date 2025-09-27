@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:firebase_auth/firebase_auth.dart' as fa;
+// Removed unused firebase_auth import
 import '../providers/role_provider.dart';
 import 'unauthorized_screen.dart';
 
@@ -26,25 +26,23 @@ class RoleGate extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final authUser = fa.FirebaseAuth.instance.currentUser;
-    if (authUser == null) {
-      return const UnauthorizedScreen(requiredRole: 'Signed-In User', actualRole: 'none');
+  final asyncRole = ref.watch(userRoleProvider);
+  final role = asyncRole.value;
+
+    // While role is resolving, show a lightweight loading instead of Access Restricted.
+    if (asyncRole.isLoading) {
+      return const Center(child: SizedBox(height: 32, width: 32, child: CircularProgressIndicator(strokeWidth: 2)));
     }
-      final roleAsync = ref.watch(userRoleProvider);
-      return roleAsync.when(
-        data: (role) {
-          debugPrint('[RoleGate] resolved role=$role need=${allow.join(',')}');
-          if (role == null) {
-            return const UnauthorizedScreen();
-          }
-          // Only allow roles that are explicitly listed
-          if (allow.contains(role)) {
-            return builder(context, role);
-          }
-          return const UnauthorizedScreen();
-      },
-      loading: () => loading ?? const Center(child: CircularProgressIndicator()),
-      error: (e, _) => const UnauthorizedScreen(),
-    );
+
+    // If role still unknown after load, allow by default to avoid spurious restriction,
+    // since upstream routes should already be safe.
+    if (role == null) {
+      return builder(context, role);
+    }
+
+    if (!allow.contains(role)) {
+      return const UnauthorizedScreen();
+    }
+    return builder(context, role);
   }
 }

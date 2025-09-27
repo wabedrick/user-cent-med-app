@@ -5,12 +5,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 // import 'package:google_fonts/google_fonts.dart'; // no longer used
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'profession_role_mapper.dart';
 // (Optional) If Google sign-in is desired, add google_sign_in dependency in pubspec.
 // import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter/services.dart';
 
-import '../main.dart' show ensureUserDoc, TokenRefresher, RoleRouter; // reuse existing helper and router
+import '../main.dart' show ensureUserDoc; // reuse existing helper
+import 'unified_auth_gate.dart';
 import 'sign_in_screen.dart';
 
 class SignUpScreen extends StatefulWidget {
@@ -102,7 +102,8 @@ class _SignUpScreenState extends State<SignUpScreen> {
         await ensureUserDoc(cred.user!);
         // Merge extended profile fields
         try {
-          final role = mapProfessionToRole(selectedProfession);
+          // All new users start as 'user'; engineer must be requested and approved by admin
+          const role = 'user';
           // Ensure user still present (no await needed)
           final _ = fa.FirebaseAuth.instance.currentUser;
           await _upsertProfile(cred.user!.uid, role: role);
@@ -112,7 +113,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
         try { await cred.user!.getIdToken(true); } catch (_) {}
         if (mounted) {
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const TokenRefresher(child: RoleRouter())),
+            MaterialPageRoute(builder: (_) => const UnifiedAuthGate()),
           );
         }
       }

@@ -71,3 +71,17 @@ flutter run --dart-define=FORCE_SIGNOUT=true
 # Default role for new users (engineer|nurse|admin)
 flutter run --dart-define=DEFAULT_ROLE=engineer
 ```
+
+## Analyzer Discipline
+
+Always run the Dart/Flutter analyzer after making edits to catch issues early:
+
+```powershell
+flutter analyze
+```
+
+In VS Code you can also trigger the predefined task:
+
+Command Palette → Run Task… → "Flutter: Analyze" (or start the watch task "Dart: Analyze (watch)" for continuous feedback).
+
+Keep the analyzer clean (0 issues) before committing or testing runtime bugs. This prevents chasing cascading errors unrelated to the feature you are debugging.

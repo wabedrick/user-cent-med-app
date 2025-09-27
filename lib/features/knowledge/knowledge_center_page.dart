@@ -2,6 +2,7 @@
 import 'dart:io';
 import 'package:firebase_auth/firebase_auth.dart' as fa;
 import 'package:firebase_storage/firebase_storage.dart';
+import '../../repositories/user_repository.dart'; // for userByIdProvider
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -15,6 +16,7 @@ import '../../providers/role_provider.dart'; // includes userRoleProvider, fires
 import 'storage_pagination_controller.dart';
 import 'package:flutter/services.dart';
 import '../../widgets/error_utils.dart';
+import '../../repositories/feed_repository.dart';
 
 // Legacy list providers replaced by paginated controllers.
 
@@ -31,7 +33,6 @@ class KnowledgeCenterPage extends ConsumerStatefulWidget {
 class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
   bool _uploading = false;
   double _progress = 0;
-  String? _uploadLabel;
   String? _currentFileName;
   int _currentFileBytes = 0;
   UploadTask? _currentTask;
@@ -88,6 +89,14 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
 
   Future<void> _pickAndUpload({required bool isVideo}) async {
     if (_uploading) return;
+    // Preflight: ensure we have the engineer/admin claim before picking the file to avoid failing late
+    final preflightOk = await _ensureClaimForUpload();
+    if (!preflightOk) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Upload blocked: missing role claim. Try syncing from banner or sign out/in.')));
+      }
+      return;
+    }
     final messenger = ScaffoldMessenger.of(context); // capture before async gaps
     final result = await FilePicker.platform.pickFiles(allowMultiple: false, type: FileType.custom, allowedExtensions: isVideo ? _videoExt : ['pdf']);
     if (result == null || result.files.isEmpty) return;
@@ -101,7 +110,6 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
     setState(() {
       _uploading = true;
       _progress = 0;
-      _uploadLabel = 'Uploading ${isVideo ? 'video' : 'manual'}...';
       _currentFileName = refTarget.name;
       _currentFileBytes = picked.size;
     });
@@ -113,8 +121,14 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
         final callable = FirebaseFunctions.instance.httpsCallable('selfSyncRoleClaim');
         final res = await callable.call();
         debugPrint('[UPLOAD] selfSyncRoleClaim result: ${res.data}');
+        // Force-refresh ID token and invalidate role providers
         await fa.FirebaseAuth.instance.currentUser?.getIdToken(true);
-        if (mounted) ref.invalidate(userRoleProvider);
+        if (mounted) {
+          ref.invalidate(roleClaimProvider);
+          ref.invalidate(userRoleProvider);
+        }
+        // Small backoff to allow client SDK to pick up new claim
+        await Future.delayed(const Duration(milliseconds: 200));
         return true;
       } catch (e) {
         debugPrint('[UPLOAD] selfSyncRoleClaim failed: $e');
@@ -133,7 +147,102 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
       });
       await task;
       if (!mounted) return;
-  messenger.showSnackBar(SnackBar(content: Text('Uploaded ${refTarget.name}')));
+      messenger.showSnackBar(SnackBar(content: Text('Uploaded ${refTarget.name}')));
+      // Share to feed as a post with a required label (title) and optional description
+      try {
+        final url = await refTarget.getDownloadURL();
+        if (!mounted) return;
+        final result = await showDialog<({String title, String caption})?>(
+          context: context,
+          builder: (dCtx) {
+            final titleCtrl = TextEditingController(text: refTarget.name);
+            final captionCtrl = TextEditingController();
+            return AlertDialog(
+              title: Text(isVideo ? 'Publish video to feed' : 'Publish manual to feed'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: 'Label (required)', border: OutlineInputBorder())),
+                  const SizedBox(height: 8),
+                  TextField(controller: captionCtrl, maxLines: 3, decoration: const InputDecoration(labelText: 'Description (optional)', border: OutlineInputBorder())),
+                ],
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.of(dCtx).pop(null), child: const Text('Cancel')),
+                FilledButton(
+                  onPressed: () {
+                    final t = titleCtrl.text.trim();
+                    if (t.isEmpty) return; // keep dialog open
+                    Navigator.of(dCtx).pop((title: t, caption: captionCtrl.text.trim()));
+                  },
+                  child: const Text('Publish'),
+                ),
+              ],
+            );
+          },
+        );
+        if (result != null) {
+          final user = fa.FirebaseAuth.instance.currentUser;
+          if (user != null) {
+            // Derive a basic handle placeholder: last segment of displayName/email in lowercase.
+            String authorHandle;
+            try {
+              final u = ref.read(userByIdProvider(user.uid)).value;
+              if (u?.username != null && u!.username!.isNotEmpty) {
+                authorHandle = u.username!;
+              } else {
+                final raw = (user.displayName ?? user.email ?? '').trim();
+                final parts = raw.split(RegExp(r'\s+'));
+                String handleBase = parts.isNotEmpty ? parts.last : raw;
+                if (handleBase.contains('@')) handleBase = handleBase.split('@').first;
+                authorHandle = handleBase.isEmpty ? 'user' : handleBase.toLowerCase();
+              }
+            } catch (_) {
+              final raw = (user.displayName ?? user.email ?? '').trim();
+              final parts = raw.split(RegExp(r'\s+'));
+              String handleBase = parts.isNotEmpty ? parts.last : raw;
+              if (handleBase.contains('@')) handleBase = handleBase.split('@').first;
+              authorHandle = handleBase.isEmpty ? 'user' : handleBase.toLowerCase();
+            }
+            final feed = ref.read(feedRepositoryProvider);
+            if (isVideo) {
+              try {
+                await feed.createVideoPost(
+                  authorId: user.uid,
+                  authorName: user.displayName ?? (user.email ?? 'Engineer'),
+                  authorHandle: authorHandle,
+                  authorAvatarUrl: user.photoURL,
+                  title: result.title,
+                  caption: result.caption,
+                  videoUrl: url,
+                  fileName: refTarget.name,
+                  // TODO: add durationMs & sizeBytes metadata fields after probing (future enhancement)
+                );
+              } catch (e) {
+                if (mounted) showFriendlyError(context, e, fallback: 'Could not publish video post.');
+              }
+            } else {
+              try {
+                await feed.createManualPost(
+                  authorId: user.uid,
+                  authorName: user.displayName ?? (user.email ?? 'Engineer'),
+                  authorHandle: authorHandle,
+                  authorAvatarUrl: user.photoURL,
+                  title: result.title,
+                  caption: result.caption,
+                  fileUrl: url,
+                  fileName: refTarget.name,
+                );
+              } catch (e) {
+                if (mounted) showFriendlyError(context, e, fallback: 'Could not publish manual post.');
+              }
+            }
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Shared to feed')));
+            }
+          }
+        }
+      } catch (_) {}
       if (isVideo) {
         // Refresh video pagination
         await ref.read(videosPaginatedProvider.notifier).refresh();
@@ -192,12 +301,39 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
       if (mounted) {
         setState(() {
           _uploading = false;
-          _uploadLabel = null;
           _currentTask = null;
           _currentFileName = null;
           _currentFileBytes = 0;
         });
       }
+    }
+  }
+
+  /// Ensure the custom claim reflects engineer/admin before Storage writes.
+  /// Attempts a self-sync and token refresh if Firestore indicates engineer/admin but claim is missing.
+  Future<bool> _ensureClaimForUpload() async {
+    try {
+      final fsRole = await ref.read(firestoreUserRoleProvider.future);
+      final claimRole = await ref.read(roleClaimProvider.future);
+      final needsSync = (claimRole == null || claimRole.isEmpty) && (fsRole == 'engineer' || fsRole == 'admin');
+      if (!needsSync) return (claimRole == 'engineer' || claimRole == 'admin');
+      try {
+        final callable = FirebaseFunctions.instance.httpsCallable('selfSyncRoleClaim');
+        await callable.call();
+        await fa.FirebaseAuth.instance.currentUser?.getIdToken(true);
+        if (mounted) {
+          ref.invalidate(roleClaimProvider);
+          ref.invalidate(userRoleProvider);
+        }
+        await Future.delayed(const Duration(milliseconds: 200));
+        final refreshedClaim = await ref.read(roleClaimProvider.future);
+        return refreshedClaim == 'engineer' || refreshedClaim == 'admin';
+      } catch (e) {
+        debugPrint('[PREUPLOAD] claim sync failed: $e');
+        return false;
+      }
+    } catch (_) {
+      return false;
     }
   }
 
@@ -238,7 +374,7 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
       context: context,
       builder: (ctx) {
         final roleAsync = ref.watch(userRoleProvider);
-        final canManage = roleAsync.canManageKnowledge;
+            final canManage = roleAsync.canManageKnowledge;
         return SafeArea(
           child: Wrap(
             children: [
@@ -254,6 +390,12 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
                   title: const Text('Upload Video (MP4/MOV)'),
                   onTap: () { Navigator.pop(ctx); _pickAndUpload(isVideo: true); },
                 ),
+                  if (canManage)
+                    ListTile(
+                      leading: const Icon(Icons.image_outlined),
+                      title: const Text('Upload Image (JPG/PNG)'),
+                      onTap: () { Navigator.pop(ctx); _pickAndUploadImage(); },
+                    ),
               if (canManage)
                 ListTile(
                   leading: const Icon(Icons.add_link),
@@ -272,6 +414,115 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
     );
   }
 
+  Future<void> _pickAndUploadImage() async {
+    if (_uploading) return;
+    final preflightOk = await _ensureClaimForUpload();
+    if (!preflightOk) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Upload blocked: missing role claim.')));
+      }
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    final result = await FilePicker.platform.pickFiles(allowMultiple: false, type: FileType.image);
+    if (result == null || result.files.isEmpty) return;
+    final picked = result.files.single;
+    final path = picked.path;
+    final bytes = picked.bytes;
+    if (path == null && bytes == null) return;
+    final storage = FirebaseStorage.instance;
+    Reference refTarget = storage.ref('images/${picked.name}');
+    refTarget = await _dedupeName(refTarget);
+    if (!mounted) return;
+    setState(() {
+      _uploading = true;
+      _progress = 0;
+      _currentFileName = refTarget.name;
+      _currentFileBytes = picked.size;
+    });
+    try {
+      final data = bytes ?? await File(path!).readAsBytes();
+      final upload = refTarget.putData(data, SettableMetadata(contentType: 'image/jpeg'));
+      _currentTask = upload;
+      upload.snapshotEvents.listen((snap) {
+        if (!mounted) return;
+        if (snap.totalBytes > 0) {
+          setState(() => _progress = snap.bytesTransferred / snap.totalBytes);
+        }
+      });
+      await upload;
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('Uploaded ${refTarget.name}')));
+      try {
+        final url = await refTarget.getDownloadURL();
+        if (!mounted) return;
+        final result = await showDialog<({String title, String caption})?>(
+          context: context,
+          builder: (dCtx) {
+            final titleCtrl = TextEditingController(text: refTarget.name);
+            final captionCtrl = TextEditingController();
+            return AlertDialog(
+              title: const Text('Publish image to feed'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: 'Label (required)', border: OutlineInputBorder())),
+                  const SizedBox(height: 8),
+                  TextField(controller: captionCtrl, maxLines: 3, decoration: const InputDecoration(labelText: 'Description (optional)', border: OutlineInputBorder())),
+                ],
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.of(dCtx).pop(null), child: const Text('Cancel')),
+                FilledButton(
+                  onPressed: () {
+                    final t = titleCtrl.text.trim();
+                    if (t.isEmpty) return;
+                    Navigator.of(dCtx).pop((title: t, caption: captionCtrl.text.trim()));
+                  },
+                  child: const Text('Publish'),
+                ),
+              ],
+            );
+          },
+        );
+        if (result != null) {
+          final user = fa.FirebaseAuth.instance.currentUser;
+          if (user != null) {
+            final feed = ref.read(feedRepositoryProvider);
+            final raw = (user.displayName ?? user.email ?? '').trim();
+            final parts = raw.split(RegExp(r'\s+'));
+            String handleBase = parts.isNotEmpty ? parts.last : raw;
+            if (handleBase.contains('@')) handleBase = handleBase.split('@').first;
+            final authorHandle = handleBase.isEmpty ? 'user' : handleBase.toLowerCase();
+            await feed.createImagePost(
+              authorId: user.uid,
+              authorName: user.displayName ?? (user.email ?? 'Engineer'),
+              authorHandle: authorHandle,
+              authorAvatarUrl: user.photoURL,
+              title: result.title,
+              caption: result.caption,
+              imageUrls: [url],
+            );
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Shared to feed')));
+            }
+          }
+        }
+      } catch (_) {}
+    } catch (e) {
+      if (mounted) showFriendlyError(context, e, fallback: 'Upload failed.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _uploading = false;
+          _currentTask = null;
+          _currentFileName = null;
+          _currentFileBytes = 0;
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
   final roleAsync = ref.watch(userRoleProvider);
@@ -287,7 +538,7 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
         Scaffold(
           appBar: AppBar(title: const Text('Knowledge Center')),
           floatingActionButton: FloatingActionButton(
-            onPressed: _showAddMenu,
+            onPressed: canManage ? _showAddMenu : null,
             child: const Icon(Icons.add),
           ),
           body: RefreshIndicator(
@@ -395,34 +646,69 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
                   error: (e, _) => _ErrorInline(msg: 'Couldn’t list manuals'),
                 ),
                 const SizedBox(height: 24),
-                _SectionHeader(title: 'Videos', onUpload: canManage ? () => _pickAndUpload(isVideo: true) : null, icon: Icons.video_file_outlined),
-                const SizedBox(height: 8),
-                videos.when(
-                  data: (stateData) {
-                    final notifier = ref.read(videosPaginatedProvider.notifier);
-                    var items = stateData.items;
-                    if (query.isNotEmpty) {
-                      items = items.where((r) => r.name.toLowerCase().contains(query)).toList();
-                    }
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        if (items.isEmpty) const _Empty(text: 'No videos uploaded yet') else ...items.map((r) => _StorageItemTile(ref: r)),
-                        if (stateData.hasMore)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 8),
-                            child: OutlinedButton(
-                              onPressed: stateData.isLoadingMore ? null : () => notifier.loadMore(),
-                              child: stateData.isLoadingMore ? const SizedBox(height:16,width:16,child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Load more'),
+                if (canManage) ...[
+                  _SectionHeader(title: 'Videos', onUpload: canManage ? () => _pickAndUpload(isVideo: true) : null, icon: Icons.video_file_outlined),
+                  const SizedBox(height: 8),
+                  videos.when(
+                    data: (stateData) {
+                      final notifier = ref.read(videosPaginatedProvider.notifier);
+                      var items = stateData.items;
+                      if (query.isNotEmpty) {
+                        items = items.where((r) => r.name.toLowerCase().contains(query)).toList();
+                      }
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          if (items.isEmpty) const _Empty(text: 'No videos uploaded yet') else ...items.map((r) => _StorageItemTile(ref: r)),
+                          if (stateData.hasMore)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: OutlinedButton(
+                                onPressed: stateData.isLoadingMore ? null : () => notifier.loadMore(),
+                                child: stateData.isLoadingMore ? const SizedBox(height:16,width:16,child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Load more'),
+                              ),
                             ),
-                          ),
-                      ],
-                    );
-                  },
-                  loading: () => const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator())),
-                  error: (e, _) => _ErrorInline(msg: 'Couldn’t list videos'),
-                ),
-                const SizedBox(height: 24),
+                        ],
+                      );
+                    },
+                    loading: () => const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator())),
+                    error: (e, _) => _ErrorInline(msg: 'Couldn’t list videos'),
+                  ),
+                  const SizedBox(height: 24),
+                  _SectionHeader(title: 'Images', onUpload: canManage ? _pickAndUploadImage : null, icon: Icons.image_outlined),
+                  const SizedBox(height: 8),
+                  Consumer(
+                    builder: (context, ref, _) {
+                      final images = ref.watch(imagesPaginatedProvider);
+                      return images.when(
+                        data: (stateData) {
+                          final notifier = ref.read(imagesPaginatedProvider.notifier);
+                          var items = stateData.items;
+                          if (query.isNotEmpty) {
+                            items = items.where((r) => r.name.toLowerCase().contains(query)).toList();
+                          }
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              if (items.isEmpty) const _Empty(text: 'No images uploaded yet') else ...items.map((r) => _StorageItemTile(ref: r)),
+                              if (stateData.hasMore)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: OutlinedButton(
+                                    onPressed: stateData.isLoadingMore ? null : () => notifier.loadMore(),
+                                    child: stateData.isLoadingMore ? const SizedBox(height:16,width:16,child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Load more'),
+                                  ),
+                                ),
+                            ],
+                          );
+                        },
+                        loading: () => const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator())),
+                        error: (e, _) => _ErrorInline(msg: 'Couldn’t list images'),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 24),
+                ],
                 const Text('External Links', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 8),
                 links.when(
@@ -467,8 +753,7 @@ class _KnowledgeCenterPageState extends ConsumerState<KnowledgeCenterPage> {
                         ),
                       ),
                       const SizedBox(height: 16),
-                      if (_uploadLabel != null)
-                        Text(_uploadLabel!, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                      // Removed the 'Uploading ...' text; show only percentage via the progress indicator
                       if (_currentFileName != null) ...[
                         const SizedBox(height: 8),
                         Padding(
@@ -548,7 +833,8 @@ class _StorageItemTileState extends ConsumerState<_StorageItemTile> {
   @override
   Widget build(BuildContext context) {
     final roleAsync = ref.watch(userRoleProvider);
-    final isAdmin = roleAsync.isAdmin;
+  final isAdmin = roleAsync.isAdmin;
+  final isEngineer = roleAsync.isEngineer;
     return Card(
       child: ListTile(
         leading: const Icon(Icons.description_outlined),
@@ -574,7 +860,7 @@ class _StorageItemTileState extends ConsumerState<_StorageItemTile> {
                 }
               },
             ),
-            if (isAdmin)
+            if (isAdmin || isEngineer)
               IconButton(
                 tooltip: 'Delete file',
                 icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
@@ -599,6 +885,8 @@ class _StorageItemTileState extends ConsumerState<_StorageItemTile> {
                       await ref.read(manualsPaginatedProvider.notifier).refresh();
                     } else if (widget.ref.fullPath.startsWith('videos/')) {
                       await ref.read(videosPaginatedProvider.notifier).refresh();
+                    } else if (widget.ref.fullPath.startsWith('images/')) {
+                      await ref.read(imagesPaginatedProvider.notifier).refresh();
                     }
                   } catch (e) {
                     if (mounted) showFriendlyError(context, e, fallback: 'Could not delete.');

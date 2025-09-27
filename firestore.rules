@@ -18,9 +18,8 @@ service cloud.firestore {
 
     // User documents: each user can read/update own doc; creation allowed only for itself; no deletes.
     match /users/{userId} {
-      // Self can create their own doc, but cannot self-create as admin.
-      allow create: if isSelf(userId) &&
-        (request.resource.data.role == 'engineer' || request.resource.data.role == 'nurse');
+      // Self can create their own doc, but only with role 'user'. No self-elevation to engineer/nurse/admin.
+      allow create: if isSelf(userId) && request.resource.data.role == 'user';
 
       // Self can read own doc; admins can read any.
       allow read: if isSelf(userId) || isAdmin();
@@ -48,6 +47,43 @@ service cloud.firestore {
     match /ai_queries/{qId} {
       allow read: if isAdmin();
       allow write, update, delete: if false;
+    }
+
+    // Role requests: allow a signed-in user to create/update only their own request (limited fields),
+    // and admins can read all and approve/deny by updating status/metadata.
+    match /role_requests/{uid} {
+      // Allow reads by:
+      // - the owner when the doc id matches their UID (isSelf(uid))
+      // - the owner when the document's stored uid field matches their UID (covers legacy docs with mismatched IDs)
+      // - admins
+      allow read: if isSelf(uid) || (resource != null && resource.data.uid == request.auth.uid) || isAdmin();
+
+      // Self can create their own request if status='pending' and requestedRole='engineer'.
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['uid','email','displayName','requestedRole','status','createdAt','updatedAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.requestedRole == 'engineer'
+        && request.resource.data.status == 'pending';
+
+      // Self cannot change status away from pending; only admins can approve/deny.
+      allow update: if (
+        // Admin moderation: can update status and moderation metadata
+        isAdmin()
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','approvedBy','deniedBy','reason','updatedAt'])
+        && (
+          request.resource.data.status == 'approved' || request.resource.data.status == 'denied' || request.resource.data.status == 'pending'
+        )
+      ) || (
+        // Self can update non-privileged fields while still pending (e.g., displayName/email corrections)
+        isSelf(uid)
+        && resource.data.status == 'pending'
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.requestedRole == resource.data.requestedRole
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['email','displayName','updatedAt'])
+      );
+
+      // No deletes by clients; admins could optionally delete, but keep history for audit.
+      allow delete: if false;
     }
 
     // Repair requests: created by nurses (or engineers/admin), updated by engineers/admin; owner can edit description while open.
@@ -100,10 +136,7 @@ service cloud.firestore {
     match /knowledge_links/{linkId} {
       allow read: if isSignedIn();
       function validTags(arr) {
-        return arr is list
-          && arr.size() <= 10
-          && arr.where(tag => !(tag is string)).size() == 0
-          && arr.where(tag => tag.size() == 0 || tag.size() > 30).size() == 0;
+        return (arr is list) && (arr.size() <= 10);
       }
       allow create: if (isEngineer() || isAdmin())
         && request.resource.data.keys().hasOnly(['title','titleLower','url','type','equipmentId','createdBy','createdAt','tags'])
@@ -115,7 +148,7 @@ service cloud.firestore {
         && (request.resource.data.type == 'video' || request.resource.data.type == 'pdf')
         && (request.resource.data.equipmentId == null || (request.resource.data.equipmentId is string && request.resource.data.equipmentId.size() <= 200))
         && request.resource.data.createdBy == request.auth.uid
-        && (request.resource.data.tags == null || validTags(request.resource.data.tags));
+  && (request.resource.data.tags == null || validTags(request.resource.data.tags));
 
       allow update: if (isEngineer() || isAdmin())
         && request.resource.data.diff(resource.data).changedKeys().hasOnly(['title','titleLower','url','type','equipmentId','tags'])
@@ -126,9 +159,88 @@ service cloud.firestore {
         && request.resource.data.url is string && request.resource.data.url.size() <= 2000
         && (request.resource.data.type == 'video' || request.resource.data.type == 'pdf')
         && (request.resource.data.equipmentId == null || (request.resource.data.equipmentId is string && request.resource.data.equipmentId.size() <= 200))
-        && (request.resource.data.tags == null || validTags(request.resource.data.tags));
+  && (request.resource.data.tags == null || validTags(request.resource.data.tags));
 
       allow delete: if isAdmin();
+    }
+
+    // Social posts (feed)
+    // Fields: authorId, authorName, authorAvatarUrl, caption, imageUrls[], kind('image'|'video'|'manual'),
+    // videoUrl?, fileUrl?, fileName?, equipmentId?, equipmentName?, createdAt, likeCount, likedBy[]
+    match /posts/{postId} {
+      allow read: if isSignedIn();
+      allow create: if (isEngineer() || isAdmin())
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['authorId','authorName','authorAvatarUrl','title','caption','imageUrls','kind','videoUrl','fileUrl','fileName','equipmentId','equipmentName','createdAt','likeCount','likedBy'])
+        && (request.resource.data.title == null || (request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 120))
+        && request.resource.data.caption is string
+        && request.resource.data.imageUrls is list
+        && request.resource.data.likeCount is number
+        && request.resource.data.likedBy is list;
+
+      // Allow signed-in users to toggle likes only
+      allow update: if isSignedIn()
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['likedBy','likeCount']);
+
+      allow delete: if isAdmin();
+    }
+
+    // Consult requests (Q&A between user and engineer)
+    // Fields: userId, question, status('open'|'claimed'|'answered'|'closed'), claimedBy?, answer?, createdAt, updatedAt, answeredAt?
+    // Creation: any signed-in user creates with their own userId, status 'open', no claimedBy/answer.
+    // Reads: owner can read own; engineers & admins can read all.
+    // Claim: engineers/admins can transition open -> claimed setting claimedBy (self) & updatedAt.
+    // Answer: only the claimer (engineer/admin) can set answer and move claimed -> answered (sets answeredAt & updatedAt).
+    // Close: owner OR engineer/admin can move answered -> closed (or claimed -> closed if abandoned) updating status & updatedAt.
+    match /consult_requests/{cid} {
+      function isOwner() { return isSignedIn() && resource != null && resource.data.userId == request.auth.uid; }
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['userId','question','status','claimedBy','answer','createdAt','updatedAt','answeredAt'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.claimedBy == null
+        && (request.resource.data.answer == null)
+        && request.resource.data.question is string
+        && request.resource.data.question.size() > 0
+        && request.resource.data.question.size() <= 2000;
+      // Reads (query & get): owner can read own; engineers/admins can read all.
+      allow get, list: if isAdmin() || isEngineer() || (resource != null && resource.data.userId == request.auth.uid);
+
+      allow update: if resource != null && (
+        // Claim: engineer/admin takes an open consult
+        ((isEngineer() || isAdmin())
+          && resource.data.status == 'open'
+          && request.resource.data.status == 'claimed'
+          && request.resource.data.claimedBy == request.auth.uid
+          // Ensure no answer is injected during claim
+          && resource.data.answer == null
+          && request.resource.data.answer == resource.data.answer
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','claimedBy','updatedAt']))
+        ||
+        // Answer: claimer provides answer
+        ((isEngineer() || isAdmin())
+          && resource.data.status == 'claimed'
+          && resource.data.claimedBy == request.auth.uid
+          && request.resource.data.status == 'answered'
+          && request.resource.data.claimedBy == resource.data.claimedBy
+          // Answer can only be set once
+          && resource.data.answer == null
+          && request.resource.data.answer is string
+          && request.resource.data.answer.size() > 0
+          && request.resource.data.answer.size() <= 10000
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','answer','updatedAt','answeredAt']))
+        ||
+        // Close: owner or engineer/admin closes answered (or claimed if necessary) consult
+        ((isOwner() || isEngineer() || isAdmin())
+          && (resource.data.status == 'answered' || resource.data.status == 'claimed')
+          && request.resource.data.status == 'closed'
+          // Close must not alter answer/claimedBy
+          && request.resource.data.answer == resource.data.answer
+          && request.resource.data.claimedBy == resource.data.claimedBy
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['status','updatedAt']))
+      );
+
+      allow delete: if false; // retention for audit
     }
 
     // Default deny everything else.

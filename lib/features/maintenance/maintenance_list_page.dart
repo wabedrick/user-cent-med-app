@@ -1,4 +1,5 @@
 import 'package:firebase_auth/firebase_auth.dart';
+import '../../providers/role_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../services/maintenance_reminder_service.dart';
@@ -11,7 +12,9 @@ class MaintenanceListPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final user = FirebaseAuth.instance.currentUser;
-    final my = user == null ? const AsyncValue<List<MaintenanceSchedule>>.data([]) : ref.watch(myMaintenanceProvider(user.uid));
+  final my = user == null ? const AsyncValue<List<MaintenanceSchedule>>.data([]) : ref.watch(myMaintenanceProvider(user.uid));
+  final roleAsync = ref.watch(userRoleProvider);
+  final canManage = roleAsync.canManageKnowledge; // reuse engineer/admin check
     final upcoming = ref.watch(upcomingMaintenanceProvider);
     return Scaffold(
       appBar: AppBar(
@@ -38,7 +41,7 @@ class MaintenanceListPage extends ConsumerWidget {
             ),
         ],
       ),
-      floatingActionButton: _canCreate(user)
+      floatingActionButton: (user != null && canManage)
           ? FloatingActionButton(
               onPressed: () async {
                 await showDialog(context: context, builder: (_) => const _NewMaintenanceDialog());
@@ -67,12 +70,7 @@ class MaintenanceListPage extends ConsumerWidget {
     );
   }
 
-  bool _canCreate(User? user) {
-    // UI hint only; Firestore rules are the source of truth.
-    // We don’t have claims here; allow engineers/admin by convention via email hint or feature flag.
-    // Keep permissive UI, rely on rules to enforce.
-    return user != null; 
-  }
+  // Removed permissive _canCreate; role-based gating now handled in build.
 }
 
 class _Section extends ConsumerWidget {

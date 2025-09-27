@@ -6,6 +6,27 @@ const db = admin.firestore();
 
 const ALLOWED_ROLES = new Set(['engineer', 'nurse', 'medic', 'admin']);
 
+function normalizeRole(input: unknown): string | undefined {
+    if (typeof input !== 'string') return undefined;
+    const s = input.toLowerCase().trim();
+    // Common aliases/synonyms
+    const alias: Record<string, string> = {
+        'biomedical engineer': 'engineer',
+        'biomed': 'engineer',
+        'engineers': 'engineer',
+        'eng': 'engineer',
+        'administrator': 'admin',
+        'doctor': 'medic',
+        'clinician': 'medic',
+        'clinical officer': 'medic',
+    };
+    if (alias[s]) return alias[s];
+    if (ALLOWED_ROLES.has(s)) return s;
+    // Heuristic: any string containing 'engineer' maps to engineer
+    if (s.includes('engineer')) return 'engineer';
+    return undefined;
+}
+
 interface RoleChangeRequest {
     targetUid: string;
     newRole: string;
@@ -84,7 +105,8 @@ export const selfSyncRoleClaim = functions.https.onCall(async (_data, context) =
     if (!userDoc.exists) {
         throw new functions.https.HttpsError('not-found', 'User doc missing');
     }
-    const docRole = (userDoc.data() as any).role as string | undefined;
+    const data = userDoc.data() as any;
+    const docRole = normalizeRole(data?.role) ?? normalizeRole(data?.profession);
     if (!docRole || !ALLOWED_ROLES.has(docRole)) {
         throw new functions.https.HttpsError('failed-precondition', 'Invalid role in user doc');
     }
@@ -323,3 +345,90 @@ export const maintenanceRemindersDaily = functions.pubsub.schedule('every 24 hou
     }
     return null;
 });
+
+// Notify engineers/admins on new consult request creation
+export const onConsultRequestCreate = functions.firestore
+    .document('consult_requests/{consultId}')
+    .onCreate(async (snap, context) => {
+        const data = snap.data() as any;
+        const question: string = (data.question || '').toString();
+        if (!question) return;
+        try {
+            // Fetch up to 500 engineer/admin users with fcmToken
+            const rolesToNotify = ['engineer', 'admin'];
+            const usersSnap = await db.collection('users')
+                .where('role', 'in', rolesToNotify)
+                .get();
+            const tokens: string[] = [];
+            usersSnap.forEach(doc => {
+                const uData = doc.data() as any;
+                const t = uData.fcmToken as string | undefined;
+                if (t) tokens.push(t);
+            });
+            if (tokens.length === 0) return;
+            const body = question.length > 80 ? question.substring(0, 77) + '...' : question;
+            // Batch in chunks (FCM sendEach can handle array of messages but we send multicast for efficiency)
+            const batchSize = 500; // FCM limit for sendMulticast
+            for (let i = 0; i < tokens.length; i += batchSize) {
+                const chunk = tokens.slice(i, i + batchSize);
+                await admin.messaging().sendMulticast({
+                    tokens: chunk,
+                    notification: {
+                        title: 'New Consult Request',
+                        body,
+                    },
+                    data: {
+                        type: 'consult_new',
+                        consultId: context.params.consultId,
+                    },
+                });
+            }
+        } catch (e) {
+            console.error('onConsultRequestCreate error', e);
+        }
+    });
+
+// Notify consult owner when answered
+export const onConsultRequestAnswer = functions.firestore
+    .document('consult_requests/{consultId}')
+    .onUpdate(async (change, context) => {
+        const before = change.before.data() as any;
+        const after = change.after.data() as any;
+        if (!before || !after) return;
+        // Trigger only on transition to answered with newly set answer
+        if (before.status !== 'answered' && after.status === 'answered' && !before.answer && after.answer) {
+            const ownerId = after.userId as string | undefined;
+            if (!ownerId) return;
+            try {
+                // Simple throttle: if we already wrote a notification timestamp within last 30s, skip
+                const lastNotifiedAt = after._answeredNotifiedAt as FirebaseFirestore.Timestamp | undefined;
+                const now = admin.firestore.Timestamp.now();
+                if (lastNotifiedAt) {
+                    const secondsDiff = now.seconds - lastNotifiedAt.seconds;
+                    if (secondsDiff < 30) {
+                        console.log('Skipping duplicate answered notification for consult', context.params.consultId);
+                        return;
+                    }
+                }
+                const userDoc = await db.collection('users').doc(ownerId).get();
+                const token = userDoc.exists ? (userDoc.data() as any)?.fcmToken as string | undefined : undefined;
+                if (!token) return;
+                const short = (after.answer as string).length > 80 ? (after.answer as string).substring(0, 77) + '...' : after.answer;
+                await admin.messaging().send({
+                    token,
+                    notification: {
+                        title: 'Consult Answered',
+                        body: short || 'Your consult has been answered.'
+                    },
+                    data: {
+                        type: 'consult_answered',
+                        consultId: context.params.consultId,
+                    },
+                });
+                // Persist notification timestamp (non-security critical benign field)
+                await change.after.ref.set({ _answeredNotifiedAt: now }, { merge: true });
+            } catch (e) {
+                console.error('onConsultRequestAnswer error', e);
+            }
+        }
+    });

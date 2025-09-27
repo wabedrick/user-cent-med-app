@@ -42,7 +42,7 @@ class AuthRepository {
         await doc.set({
           'email': user.email,
           'emailLower': (user.email ?? '').toLowerCase(),
-          'role': 'engineer', // safe default
+          'role': 'user', // default: must request engineer and be approved by admin
           'createdAt': FieldValue.serverTimestamp(),
         });
       }

@@ -1,22 +1,22 @@
 "use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function (o, m, k, k2) {
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
     if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-        desc = { enumerable: true, get: function () { return m[k]; } };
+      desc = { enumerable: true, get: function() { return m[k]; } };
     }
     Object.defineProperty(o, k2, desc);
-}) : (function (o, m, k, k2) {
+}) : (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     o[k2] = m[k];
 }));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function (o, v) {
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
     Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function (o, v) {
+}) : function(o, v) {
     o["default"] = v;
 });
 var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function (o) {
+    var ownKeys = function(o) {
         ownKeys = Object.getOwnPropertyNames || function (o) {
             var ar = [];
             for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
@@ -33,13 +33,36 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.maintenanceRemindersDaily = exports.runMaintenanceReminders = exports.onRepairRequestChange = exports.selfSyncRoleClaim = exports.bootstrapFirstAdmin = exports.setUserRole = void 0;
+exports.maintenanceRemindersDaily = exports.runMaintenanceReminders = exports.onRepairRequestChange = exports.aiAssistantChat = exports.selfSyncRoleClaim = exports.bootstrapFirstAdmin = exports.setUserRole = void 0;
 const functions = __importStar(require("firebase-functions"));
 const admin = __importStar(require("firebase-admin"));
 admin.initializeApp();
 const db = admin.firestore();
-// Added 'medic' role (replaces previous 'nurse' UI terminology). Keep 'nurse' temporarily for backward compatibility.
 const ALLOWED_ROLES = new Set(['engineer', 'nurse', 'medic', 'admin']);
+function normalizeRole(input) {
+    if (typeof input !== 'string')
+        return undefined;
+    const s = input.toLowerCase().trim();
+    // Common aliases/synonyms
+    const alias = {
+        'biomedical engineer': 'engineer',
+        'biomed': 'engineer',
+        'engineers': 'engineer',
+        'eng': 'engineer',
+        'administrator': 'admin',
+        'doctor': 'medic',
+        'clinician': 'medic',
+        'clinical officer': 'medic',
+    };
+    if (alias[s])
+        return alias[s];
+    if (ALLOWED_ROLES.has(s))
+        return s;
+    // Heuristic: any string containing 'engineer' maps to engineer
+    if (s.includes('engineer'))
+        return 'engineer';
+    return undefined;
+}
 exports.setUserRole = functions.https.onCall(async (data, context) => {
     if (!context.auth) {
         throw new functions.https.HttpsError('unauthenticated', 'Auth required');
@@ -113,7 +136,8 @@ exports.selfSyncRoleClaim = functions.https.onCall(async (_data, context) => {
     if (!userDoc.exists) {
         throw new functions.https.HttpsError('not-found', 'User doc missing');
     }
-    const docRole = userDoc.data().role;
+    const data = userDoc.data();
+    const docRole = normalizeRole(data?.role) ?? normalizeRole(data?.profession);
     if (!docRole || !ALLOWED_ROLES.has(docRole)) {
         throw new functions.https.HttpsError('failed-precondition', 'Invalid role in user doc');
     }
@@ -130,61 +154,128 @@ exports.selfSyncRoleClaim = functions.https.onCall(async (_data, context) => {
     });
     return { status: 'updated', role: docRole };
 });
+// Minimal AI assistant callable. Requires OPENAI_API_KEY set in environment.
+// Allowed for roles: engineer, medic, admin. Nurses (legacy) denied by default.
+exports.aiAssistantChat = functions.https.onCall(async (data, context) => {
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Auth required');
+    }
+    const role = context.auth.token.role;
+    if (!(role && (role === 'engineer' || role === 'medic' || role === 'admin'))) {
+        throw new functions.https.HttpsError('permission-denied', 'Assistant limited to engineer/medic/admin');
+    }
+    if (!data || !Array.isArray(data.messages) || data.messages.length === 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'messages array required');
+    }
+    // Light validation: each message has role and content strings
+    const msgs = data.messages;
+    if (msgs.some(m => typeof m.role !== 'string' || typeof m.content !== 'string' || m.content.length === 0)) {
+        throw new functions.https.HttpsError('invalid-argument', 'invalid message format');
+    }
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    const systemPrompt = data.systemPrompt;
+    const model = data.model ?? 'gpt-4o-mini';
+    const temperature = Math.min(1, Math.max(0, Number(data.temperature ?? 0.2)));
+    // Audit input
+    await db.collection('ai_queries').add({
+        uid: context.auth.uid,
+        role,
+        model,
+        ts: admin.firestore.FieldValue.serverTimestamp(),
+        inputCount: msgs.length,
+    });
+    // If key missing, return deterministic safe response
+    if (!OPENAI_API_KEY) {
+        return {
+            status: 'no-key',
+            reply: 'AI assistant is not configured. Please contact an administrator.',
+        };
+    }
+    // Call OpenAI responses API (chat completions compatible)
+    try {
+        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model,
+                temperature,
+                messages: [
+                    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+                    ...msgs,
+                ],
+            }),
+        });
+        if (!resp.ok) {
+            const text = await resp.text();
+            throw new Error(`OpenAI error ${resp.status}: ${text}`);
+        }
+        const json = await resp.json();
+        const reply = json?.choices?.[0]?.message?.content || '';
+        return { status: 'ok', reply };
+    }
+    catch (e) {
+        console.error('aiAssistantChat error', e);
+        throw new functions.https.HttpsError('internal', 'Assistant error');
+    }
+});
 // Notify on repair request assignment and completion
 exports.onRepairRequestChange = functions.firestore
     .document('repair_requests/{reqId}')
     .onWrite(async (change, context) => {
-        const before = change.before.exists ? change.before.data() : undefined;
-        const after = change.after.exists ? change.after.data() : undefined;
-        if (!after) {
-            return;
+    const before = change.before.exists ? change.before.data() : undefined;
+    const after = change.after.exists ? change.after.data() : undefined;
+    if (!after) {
+        return;
+    }
+    const db = admin.firestore();
+    const messages = [];
+    // Assigned engineer notification (assignment from null -> some uid)
+    if ((!before || !before.assignedEngineerId) && after.assignedEngineerId) {
+        const engineerId = String(after.assignedEngineerId);
+        try {
+            const uDoc = await db.collection('users').doc(engineerId).get();
+            const token = (uDoc.exists ? uDoc.data()?.fcmToken : undefined);
+            if (token) {
+                messages.push({
+                    token,
+                    notification: { title: 'New Assignment', body: 'A repair request has been assigned to you.' },
+                    data: { type: 'repair_assigned', reqId: context.params.reqId },
+                });
+            }
         }
-        const db = admin.firestore();
-        const messages = [];
-        // Assigned engineer notification (assignment from null -> some uid)
-        if ((!before || !before.assignedEngineerId) && after.assignedEngineerId) {
-            const engineerId = String(after.assignedEngineerId);
+        catch (_) { }
+    }
+    // Reporter notification on completion (status changed to 'resolved' or 'closed')
+    if (before &&
+        before.status !== after.status &&
+        (after.status === 'resolved' || after.status === 'closed')) {
+        const reporterId = String(after.reportedByUserId || '');
+        if (reporterId) {
             try {
-                const uDoc = await db.collection('users').doc(engineerId).get();
+                const uDoc = await db.collection('users').doc(reporterId).get();
                 const token = (uDoc.exists ? uDoc.data()?.fcmToken : undefined);
                 if (token) {
                     messages.push({
                         token,
-                        notification: { title: 'New Assignment', body: 'A repair request has been assigned to you.' },
-                        data: { type: 'repair_assigned', reqId: context.params.reqId },
+                        notification: { title: 'Request Completed', body: 'Your repair request has been marked as completed.' },
+                        data: { type: 'repair_completed', reqId: context.params.reqId },
                     });
                 }
             }
             catch (_) { }
         }
-        // Reporter notification on completion (status changed to 'resolved' or 'closed')
-        if (before &&
-            before.status !== after.status &&
-            (after.status === 'resolved' || after.status === 'closed')) {
-            const reporterId = String(after.reportedByUserId || '');
-            if (reporterId) {
-                try {
-                    const uDoc = await db.collection('users').doc(reporterId).get();
-                    const token = (uDoc.exists ? uDoc.data()?.fcmToken : undefined);
-                    if (token) {
-                        messages.push({
-                            token,
-                            notification: { title: 'Request Completed', body: 'Your repair request has been marked as completed.' },
-                            data: { type: 'repair_completed', reqId: context.params.reqId },
-                        });
-                    }
-                }
-                catch (_) { }
-            }
+    }
+    if (messages.length > 0) {
+        const batchSize = 100;
+        for (let i = 0; i < messages.length; i += batchSize) {
+            const chunk = messages.slice(i, i + batchSize);
+            await admin.messaging().sendEach(chunk);
         }
-        if (messages.length > 0) {
-            const batchSize = 100;
-            for (let i = 0; i < messages.length; i += batchSize) {
-                const chunk = messages.slice(i, i + batchSize);
-                await admin.messaging().sendEach(chunk);
-            }
-        }
-    });
+    }
+});
 // On-demand maintenance reminders (Spark-friendly replacement for scheduled Pub/Sub)
 exports.runMaintenanceReminders = functions.https.onCall(async (data, context) => {
     if (!context.auth) {

@@ -55,7 +55,7 @@ class _NurseDashboardScreenState extends ConsumerState<NurseDashboardScreen> {
   @override
   Widget build(BuildContext context) {
     // Nurse has a dedicated Tasks tab distinct from Engineer
-    final titles = const ['Overview', 'Requests', 'Tasks', 'History', 'Profile'];
+  final titles = const ['Overview', 'Requests', 'Tasks', 'History', 'Profile'];
     final title = titles[(tab >= 0 && tab < titles.length) ? tab : 0];
     final width = MediaQuery.of(context).size.width;
     final isNarrow = width < 900;
@@ -176,7 +176,11 @@ class _NurseBody extends ConsumerWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Today Overview', style: Theme.of(context).textTheme.headlineMedium),
+            Text('Overview', style: Theme.of(context).textTheme.headlineMedium),
+            const SizedBox(height: 12),
+            _QuickHelpRow(onAskAI: () => Navigator.of(context).pushNamed('/assistant'), onAskEngineer: () async {
+              await showDialog(context: context, builder: (_) => const _NewRequestDialog());
+            }, onBrowseEquipment: () => Navigator.of(context).pushNamed('/equipment')),
             const SizedBox(height: 18),
             statsRow(),
             const SizedBox(height: 36),
@@ -806,6 +810,52 @@ class _ReminderChip extends StatelessWidget {
   }
 }
 
+class _QuickHelpRow extends StatelessWidget {
+  final VoidCallback onAskAI;
+  final VoidCallback onAskEngineer;
+  final VoidCallback onBrowseEquipment;
+  const _QuickHelpRow({required this.onAskAI, required this.onAskEngineer, required this.onBrowseEquipment});
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Card(
+            child: ListTile(
+              leading: const Icon(Icons.smart_toy_outlined),
+              title: const Text('Ask the AI assistant'),
+              subtitle: const Text('Get quick answers about equipment'),
+              onTap: onAskAI,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Card(
+            child: ListTile(
+              leading: const Icon(Icons.support_agent),
+              title: const Text('Ask a biomedical engineer'),
+              subtitle: const Text('Open a request for help'),
+              onTap: onAskEngineer,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Card(
+            child: ListTile(
+              leading: const Icon(Icons.precision_manufacturing_outlined),
+              title: const Text('Browse equipment'),
+              subtitle: const Text('See details and manuals'),
+              onTap: onBrowseEquipment,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _EmptyState extends StatelessWidget {
   final IconData icon;
   final String title;
@@ -927,7 +977,7 @@ class _NurseHeaderBar extends StatelessWidget {
           ],
           Expanded(
             child: Text(
-              veryNarrow ? title : 'Nurse • $title',
+              veryNarrow ? title : 'User • $title',
               style: GoogleFonts.montserrat(fontWeight: FontWeight.w600, fontSize: 16),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
@@ -965,7 +1015,7 @@ class _NurseHeaderBar extends StatelessWidget {
   }
 }
 
-// Dedicated side navigation for Nurse dashboard
+// Dedicated side navigation for User (general) dashboard
 class _NurseSideNav extends StatelessWidget {
   final int currentIndex;
   final ValueChanged<int> onSelect;
